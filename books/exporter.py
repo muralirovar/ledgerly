@@ -37,6 +37,7 @@ def business_workbook(connection: sqlite3.Connection, business_id: int) -> bytes
     _sheet(workbook, "Category Summary", db.category_summary(connection, business_id))
     _sheet(workbook, "Accounts", db.account_summaries(connection, business_id))
     _sheet(workbook, "LOC Activity", db.list_loan_events(connection, business_id))
+    _sheet(workbook, "Statement Reconciliation", db.statement_log_rows(connection, business_id))
     _sheet(workbook, "Rules", db.list_rules(connection, business_id))
     _sheet(workbook, "Import Log", db.list_import_batches(connection, business_id))
     output = BytesIO()

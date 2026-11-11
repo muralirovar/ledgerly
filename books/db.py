@@ -278,6 +278,38 @@ CREATE TABLE IF NOT EXISTS check_register (
 
 CREATE INDEX IF NOT EXISTS idx_check_register_business_date
 ON check_register(business_id, cleared_date);
+
+CREATE TABLE IF NOT EXISTS statement_log (
+    id INTEGER PRIMARY KEY,
+    business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    bank_name TEXT NOT NULL,
+    account_last4 TEXT,
+    statement_date TEXT NOT NULL,
+    statement_file_name TEXT,
+    statement_check_total REAL NOT NULL DEFAULT 0,
+    checks_listed INTEGER NOT NULL DEFAULT 0,
+    checks_mapped INTEGER NOT NULL DEFAULT 0,
+    mapped_total REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    first_logged_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, account_id, statement_date)
+);
+
+CREATE TABLE IF NOT EXISTS statement_log_checks (
+    id INTEGER PRIMARY KEY,
+    log_id INTEGER NOT NULL REFERENCES statement_log(id) ON DELETE CASCADE,
+    check_number TEXT NOT NULL,
+    cleared_date TEXT NOT NULL,
+    amount REAL NOT NULL,
+    reconciled INTEGER NOT NULL DEFAULT 0,
+    check_type TEXT,
+    payee TEXT,
+    treatment TEXT,
+    transaction_id INTEGER,
+    check_image_file TEXT
+);
 """
 
 
@@ -1294,3 +1326,99 @@ def list_loan_receivables(connection: sqlite3.Connection, business_id: int) -> l
          "balance_owed": round(v["lent"] - v["repaid"], 2)}
         for name, v in sorted(totals.items())
     ]
+
+
+def log_statement_reconciliation(
+    connection: sqlite3.Connection,
+    *,
+    business_id: int,
+    account_id: int,
+    bank_name: str,
+    account_last4: str,
+    statement_date: str,
+    statement_file_name: str | None,
+    statement_check_total: float,
+    statement_checks: list[dict[str, Any]],
+) -> int:
+    """Record which statement was reconciled and the state of each check on it.
+
+    One log entry exists per account and statement date; saving again refreshes the snapshot
+    (so progress is captured as checks are confirmed) while keeping the first-logged time.
+    """
+    now = utc_now()
+    register = {
+        (str(row["check_number"]), row["cleared_date"], round(float(row["amount"]), 2)): dict(row)
+        for row in connection.execute(
+            "SELECT * FROM check_register WHERE business_id = ? AND account_id = ?",
+            (business_id, account_id),
+        )
+    }
+    lines = []
+    for item in statement_checks:
+        key = (str(item["check_number"]), item["cleared_date"], round(float(item["amount"]), 2))
+        entry = register.get(key)
+        lines.append((item, entry))
+    mapped = [(item, entry) for item, entry in lines if entry]
+    mapped_total = round(sum(float(item["amount"]) for item, _ in mapped), 2)
+    complete = bool(lines) and len(mapped) == len(lines)
+    status = "Reconciled" if complete else ("In progress" if mapped else "Not started")
+    existing = connection.execute(
+        "SELECT id, first_logged_at FROM statement_log WHERE business_id=? AND account_id=? AND statement_date=?",
+        (business_id, account_id, statement_date),
+    ).fetchone()
+    if existing:
+        log_id = int(existing["id"])
+        connection.execute(
+            """UPDATE statement_log SET bank_name=?, account_last4=?, statement_file_name=COALESCE(?, statement_file_name),
+                   statement_check_total=?, checks_listed=?, checks_mapped=?, mapped_total=?, status=?, updated_at=?
+               WHERE id=?""",
+            (bank_name, account_last4, statement_file_name, statement_check_total, len(lines),
+             len(mapped), mapped_total, status, now, log_id),
+        )
+        connection.execute("DELETE FROM statement_log_checks WHERE log_id = ?", (log_id,))
+    else:
+        log_id = int(connection.execute(
+            """INSERT INTO statement_log(business_id, account_id, bank_name, account_last4, statement_date,
+                   statement_file_name, statement_check_total, checks_listed, checks_mapped, mapped_total,
+                   status, first_logged_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (business_id, account_id, bank_name, account_last4, statement_date, statement_file_name,
+             statement_check_total, len(lines), len(mapped), mapped_total, status, now, now),
+        ).lastrowid)
+    connection.executemany(
+        """INSERT INTO statement_log_checks(log_id, check_number, cleared_date, amount, reconciled,
+               check_type, payee, treatment, transaction_id, check_image_file)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(log_id, str(item["check_number"]), item["cleared_date"], float(item["amount"]),
+          1 if entry else 0, entry and entry["check_type"], entry and entry["payee"],
+          entry and entry["treatment"], entry and entry["transaction_id"], entry and entry["source_file_name"])
+         for item, entry in lines],
+    )
+    return log_id
+
+
+def list_statement_log(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
+    return [dict(row) for row in connection.execute(
+        """SELECT l.id, l.statement_file_name, l.bank_name, a.name AS account, l.account_last4,
+                  l.statement_date, l.checks_listed, l.checks_mapped, l.statement_check_total,
+                  l.mapped_total, l.status, l.first_logged_at, l.updated_at
+           FROM statement_log l JOIN accounts a ON a.id = l.account_id
+           WHERE l.business_id = ? ORDER BY l.statement_date DESC, l.id DESC""",
+        (business_id,))]
+
+
+def statement_log_rows(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
+    """One row per statement check, with the statement details repeated: ready for CSV/Excel archiving."""
+    return [dict(row) for row in connection.execute(
+        """SELECT l.statement_file_name AS statement_file, l.bank_name AS bank, a.name AS account,
+                  l.account_last4, l.statement_date, l.status AS statement_status,
+                  k.check_number, k.cleared_date, k.amount,
+                  CASE k.reconciled WHEN 1 THEN 'Yes' ELSE 'No' END AS reconciled,
+                  k.check_type AS direction, k.payee AS counterparty, k.treatment,
+                  k.transaction_id, k.check_image_file, l.updated_at AS logged_at
+           FROM statement_log l
+           JOIN accounts a ON a.id = l.account_id
+           JOIN statement_log_checks k ON k.log_id = l.id
+           WHERE l.business_id = ?
+           ORDER BY l.statement_date DESC, l.id DESC, CAST(k.check_number AS INTEGER)""",
+        (business_id,))]

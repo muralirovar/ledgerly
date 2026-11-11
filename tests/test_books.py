@@ -261,6 +261,71 @@ class BooksTests(unittest.TestCase):
                 next(a for a in db.list_accounts(connection, self.business) if a["id"] == self.account)["last4"],
                 "1049")
 
+    def test_statement_log_snapshot_and_archive_rows(self):
+        from books import backup
+        statement_checks = [
+            {"check_number": "147", "cleared_date": "2026-09-15", "amount": 11000.0},
+            {"check_number": "148", "cleared_date": "2026-09-16", "amount": 250.0},
+        ]
+        log_args = dict(business_id=self.business, account_id=self.account, bank_name="Truist",
+                        account_last4="1049", statement_date="2026-09-30",
+                        statement_file_name="truist-sep-2026.pdf", statement_check_total=11250.0,
+                        statement_checks=statement_checks)
+        with db.connect(self.path) as connection:
+            db.log_statement_reconciliation(connection, **log_args)
+            self.assertEqual(db.list_statement_log(connection, self.business)[0]["status"], "Not started")
+            db.confirm_check(
+                connection, business_id=self.business, account_id=self.account, transaction_id=None,
+                bank_name="Truist", account_last4="1049", statement_date="2026-09-30", check_number="147",
+                amount=11000, written_date="2026-09-15", cleared_date="2026-09-15", payee="Colina",
+                memo="", category_id=None, treatment="Loan receivable", source_file_name="11000.pdf")
+            db.log_statement_reconciliation(connection, **log_args)
+            header = db.list_statement_log(connection, self.business)
+            self.assertEqual(len(header), 1)
+            self.assertEqual((header[0]["status"], header[0]["checks_mapped"], header[0]["checks_listed"]),
+                             ("In progress", 1, 2))
+            self.assertEqual(header[0]["statement_file_name"], "truist-sep-2026.pdf")
+            db.confirm_check(
+                connection, business_id=self.business, account_id=self.account, transaction_id=None,
+                bank_name="Truist", account_last4="1049", statement_date="2026-09-30", check_number="148",
+                amount=250, written_date="2026-09-16", cleared_date="2026-09-16", payee="Acme",
+                memo="", category_id=None, treatment="Expense", source_file_name="250.pdf")
+            db.log_statement_reconciliation(connection, **{**log_args, "statement_file_name": None})
+            header = db.list_statement_log(connection, self.business)[0]
+            self.assertEqual(header["status"], "Reconciled")
+            self.assertEqual(header["statement_file_name"], "truist-sep-2026.pdf")  # name is kept
+            rows = db.statement_log_rows(connection, self.business)
+            self.assertEqual([(r["check_number"], r["reconciled"], r["counterparty"]) for r in rows],
+                             [("147", "Yes", "Colina"), ("148", "Yes", "Acme")])
+            self.assertEqual(rows[0]["statement_file"], "truist-sep-2026.pdf")
+
+    def test_backup_restore_roundtrip(self):
+        from books import backup
+        with db.connect(self.path) as connection:
+            before = connection.execute("SELECT COUNT(*) FROM businesses").fetchone()[0]
+        made = backup.create_backup(self.path, "manual")
+        self.assertTrue(made.exists())
+        self.assertEqual(backup.validate_backup(made)["businesses"], before)
+        with db.connect(self.path) as connection:
+            db.get_or_create_business(connection, "Another Co")
+        safety = backup.restore_backup(self.path, made)
+        with db.connect(self.path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM businesses").fetchone()[0], before)
+        self.assertEqual(backup.validate_backup(safety)["businesses"], before + 1)
+        names = [row["name"] for row in backup.list_backups(self.path)]
+        self.assertIn(made.name, names)
+        backup.delete_backup(self.path, made.name)
+        self.assertNotIn(made.name, [row["name"] for row in backup.list_backups(self.path)])
+        with self.assertRaises(ValueError):
+            backup.backup_path(self.path, "../../etc/passwd")
+        bogus = Path(self.path).parent / "bogus.db"
+        bogus.write_text("not a database")
+        with self.assertRaises(ValueError):
+            backup.validate_backup(bogus)
+        first = backup.maybe_daily_backup(self.path)
+        self.assertIsNotNone(first)
+        self.assertIsNone(backup.maybe_daily_backup(self.path))  # already backed up today
+
     def test_loan_receivable_balance(self):
         self.assertIn("Loan receivable", db.TREATMENTS)
         with db.connect(self.path) as connection:

@@ -5,27 +5,48 @@ import re
 from html import escape
 from datetime import date
 from pathlib import Path
+import base64
+import hmac
 
 import pandas as pd
 import streamlit as st
 
-from books import ai_config, db, exporter, importers, statements
+from books import ai_config, backup, db, exporter, importers, statements
 
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("BOOKS_DB_PATH", APP_DIR / "data" / "books.db"))
 db.init_db(DB_PATH)
+if "daily_backup_checked" not in st.session_state:  # automatic daily snapshot, kept for 14 days
+    st.session_state["daily_backup_checked"] = True
+    try:
+        backup.maybe_daily_backup(DB_PATH)
+    except Exception:  # a failed automatic backup must never block the app
+        pass
 
-st.set_page_config(page_title="Ledgerly · Business Books", page_icon="◈", layout="wide",
+ASSETS_DIR = APP_DIR / "assets"
+
+
+def _asset_b64(name: str) -> str:
+    try:
+        return base64.b64encode((ASSETS_DIR / name).read_bytes()).decode()
+    except OSError:
+        return ""
+
+
+LOGO_B64 = _asset_b64("rovar-logo.png")
+_mark = ASSETS_DIR / "rovar-mark.png"
+st.set_page_config(page_title="Ledgerly · Business Books", page_icon=str(_mark) if _mark.exists() else "◈", layout="wide",
                    initial_sidebar_state="expanded")
 st.markdown("""
 <style>
   :root {
-    --ink: #14233b; --muted: #68758a; --line: #e3e8ef; --paper: #ffffff;
-    --canvas: #f4f6f9; --teal: #11847b; --teal-soft: #e8f6f3;
-    --gold: #c88723; --gold-soft: #fff4df; --rose: #c05264; --rose-soft: #fdeff1;
+    --ink: #12141d; --muted: #6a6a6a; --line: #dde4ea; --paper: #ffffff;
+    --canvas: #f2f5f6; --teal: #1778ba; --teal-soft: #e6f1f8;
+    --gold: #f0b73f; --gold-soft: #fff4d6; --rose: #c05264; --rose-soft: #fdeff1;
   }
-  html, body, [class*="css"] {font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;}
+  @import url('https://fonts.googleapis.com/css2?family=Barlow:wght@300;400;600;700&family=Barlow+Condensed:wght@600;700&display=swap');
+  html, body, [class*="css"] {font-family: Barlow, Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;}
   [data-testid="stAppViewContainer"] {background: var(--canvas); color: var(--ink);}
   header[data-testid="stHeader"] {background:transparent; height:2.2rem;}
   [data-testid="stToolbar"] {visibility:visible;}
@@ -41,7 +62,7 @@ st.markdown("""
   button[data-testid="stExpandSidebarButton"],
   [data-testid="stSidebarCollapsedControl"] button {
     width:42px !important; height:42px !important; border-radius:11px !important;
-    color:#fff !important; background:#142a43 !important;
+    color:#fff !important; background:#0d3a5c !important;
     border:1px solid rgba(255,255,255,.18) !important;
     box-shadow:0 6px 18px rgba(20,42,67,.22) !important;
   }
@@ -49,43 +70,45 @@ st.markdown("""
   body:has([data-testid="stSidebarCollapseButton"] button[aria-expanded="true"])
     button[data-testid="stExpandSidebarButton"] {display:none !important;}
   [data-testid="stMainBlockContainer"] {max-width: 1480px; padding: 2.25rem 3rem 4rem;}
-  [data-testid="stSidebar"] {background: linear-gradient(180deg, #12243a 0%, #172f48 58%, #0d3c42 100%); border-right: 0;}
+  [data-testid="stSidebar"] {background: linear-gradient(180deg, #0d3a5c 0%, #0b3150 62%, #12141d 100%); border-right: 0;}
   [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap: .72rem;}
   [data-testid="stSidebar"] label, [data-testid="stSidebar"] p, [data-testid="stSidebar"] span {color: #dce7ef;}
   [data-testid="stSidebar"] [role="radiogroup"] {gap: .25rem;}
   [data-testid="stSidebar"] [role="radiogroup"] label {padding: .72rem .85rem; border-radius: 10px; transition: .15s ease;}
   [data-testid="stSidebar"] label[data-testid="stRadioOption"] > div > div:first-child {display:none;}
   [data-testid="stSidebar"] [role="radiogroup"] label:hover {background: rgba(255,255,255,.08);}
-  [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {background: rgba(255,255,255,.14); box-shadow: inset 3px 0 0 #5bd0c3;}
+  [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {background: rgba(255,255,255,.14); box-shadow: inset 3px 0 0 #f0b73f;}
   [data-testid="stSidebar"] [data-baseweb="select"] > div {background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.15);}
   [data-testid="stSidebar"] hr {border-color: rgba(255,255,255,.12);}
   .brand {padding: .45rem .2rem 1.15rem; display:flex; align-items:center; gap:.8rem;}
-  .brand-mark {width:40px; height:40px; border-radius:12px; display:grid; place-items:center; color:#0c3e40; background:#62d5c8; font-size:1.35rem; font-weight:900; box-shadow:0 8px 24px rgba(0,0,0,.22);}
+  .brand-logo {background:#fff; border-radius:12px; padding:.55rem .8rem; box-shadow:0 8px 24px rgba(0,0,0,.22); display:flex; align-items:center;}
+  .brand-logo img {height:40px; display:block;}
+  .brand-mark {width:40px; height:40px; border-radius:12px; display:grid; place-items:center; color:#0d3a5c; background:#f0b73f; font-size:1.35rem; font-weight:900; box-shadow:0 8px 24px rgba(0,0,0,.22);}
   .brand-name {color:#fff; font-size:1.1rem; font-weight:760; letter-spacing:-.02em;}
-  .brand-sub {color:#91a9b9; font-size:.72rem; text-transform:uppercase; letter-spacing:.12em; margin-top:.1rem;}
+  .brand-sub {color:#9fc3dc; font-size:.72rem; text-transform:uppercase; letter-spacing:.12em; margin-top:.1rem;}
   .page-head {margin:.15rem 0 1.6rem;}
   .eyebrow {font-size:.73rem; font-weight:750; color:var(--teal); text-transform:uppercase; letter-spacing:.14em; margin-bottom:.45rem;}
-  .page-title {font-family: Georgia, "Times New Roman", serif; font-size:2.35rem; line-height:1.08; color:var(--ink); letter-spacing:-.035em; margin:0;}
+  .page-title {font-family: "Barlow Condensed", Barlow, sans-serif; font-weight:700; font-size:2.35rem; line-height:1.08; color:var(--ink); letter-spacing:-.035em; margin:0;}
   .page-sub {color:var(--muted); font-size:.98rem; margin-top:.55rem; max-width:760px; line-height:1.55;}
   .metric-card {background:var(--paper); border:1px solid var(--line); border-radius:16px; padding:1.15rem 1.2rem; min-height:132px; box-shadow:0 4px 18px rgba(19,37,61,.045); position:relative; overflow:hidden;}
   .metric-card:after {content:""; position:absolute; width:70px; height:70px; border-radius:50%; right:-25px; top:-27px; background:var(--tint);}
   .metric-icon {width:32px; height:32px; border-radius:9px; display:grid; place-items:center; background:var(--tint); color:var(--accent); font-weight:800; margin-bottom:.75rem;}
   .metric-label {font-size:.72rem; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; font-weight:720;}
-  .metric-value {font-family:Georgia, "Times New Roman", serif; font-size:clamp(1.35rem,2vw,1.75rem); color:var(--ink); letter-spacing:-.03em; margin-top:.2rem; white-space:nowrap;}
+  .metric-value {font-family:"Barlow Condensed", Barlow, sans-serif; font-weight:700; font-size:clamp(1.35rem,2vw,1.75rem); color:var(--ink); letter-spacing:-.03em; margin-top:.2rem; white-space:nowrap;}
   .metric-note {font-size:.78rem; color:var(--muted); margin-top:.25rem;}
   .card {background:var(--paper); border:1px solid var(--line); border-radius:16px; padding:1.25rem 1.35rem; box-shadow:0 4px 18px rgba(19,37,61,.04);}
-  .transaction-card {background:linear-gradient(135deg,#142a43,#17464c); color:#fff; border-radius:18px; padding:1.45rem 1.55rem; box-shadow:0 12px 34px rgba(20,42,67,.18); margin:.4rem 0 1rem;}
-  .transaction-card .meta {color:#9dc0c4; text-transform:uppercase; letter-spacing:.1em; font-size:.7rem; font-weight:700;}
+  .transaction-card {background:linear-gradient(135deg,#0d3a5c,#1778ba); color:#fff; border-radius:18px; padding:1.45rem 1.55rem; box-shadow:0 12px 34px rgba(20,42,67,.18); margin:.4rem 0 1rem;}
+  .transaction-card .meta {color:#bcdcf0; text-transform:uppercase; letter-spacing:.1em; font-size:.7rem; font-weight:700;}
   .transaction-card .desc {font-size:1.02rem; line-height:1.5; margin:.65rem 0 1rem; color:#f5fafb;}
-  .transaction-card .amount {font-family:Georgia,serif; font-size:2rem; letter-spacing:-.02em;}
-  .transaction-card .account {color:#b6d7d6; font-size:.84rem; margin-top:.2rem;}
+  .transaction-card .amount {font-family:"Barlow Condensed", Barlow, sans-serif; font-weight:700; font-size:2rem; letter-spacing:-.02em;}
+  .transaction-card .account {color:#cfe6f5; font-size:.84rem; margin-top:.2rem;}
   .section-kicker {font-size:.74rem; text-transform:uppercase; letter-spacing:.11em; color:var(--muted); font-weight:750; margin:1.75rem 0 .65rem;}
   div[data-testid="stForm"] {background:var(--paper); border:1px solid var(--line); border-radius:16px; padding:1.2rem 1.3rem 1.35rem; box-shadow:0 4px 18px rgba(19,37,61,.04);}
   div[data-testid="stDataFrame"] {border:1px solid var(--line); border-radius:14px; overflow:hidden; box-shadow:0 3px 14px rgba(19,37,61,.035);}
   .stButton > button, .stDownloadButton > button {border-radius:10px; min-height:2.65rem; font-weight:680; border:1px solid #d8e0e8; background:#fff; color:var(--ink);}
-  .stButton > button:hover, .stDownloadButton > button:hover {border-color:#9fb1c1; color:#0b7069;}
-  .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {background:var(--teal); color:#fff; border-color:var(--teal); box-shadow:0 5px 15px rgba(17,132,123,.2);}
-  .stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover {background:#0b7069; border-color:#0b7069;}
+  .stButton > button:hover, .stDownloadButton > button:hover {border-color:#9fb1c1; color:#0d3a5c;}
+  .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {background:var(--teal); color:#fff; border-color:var(--teal); box-shadow:0 5px 15px rgba(23,120,186,.22);}
+  .stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover {background:#0b7069; border-color:#0d3a5c;}
   [data-baseweb="select"] > div, .stTextInput input, .stNumberInput input, .stTextArea textarea {border-radius:10px !important; border-color:#dce3eb !important; background:#fff !important;}
   [data-testid="stAlert"] {border-radius:12px;}
   hr {border-color:var(--line); margin:2rem 0;}
@@ -121,8 +144,8 @@ def page_header(title: str, subtitle: str, eyebrow: str = "Workspace") -> None:
 
 def metric_card(label: str, value: str, note: str, icon: str, tone: str = "teal") -> None:
     colors = {
-        "teal": ("#11847b", "#e8f6f3"), "navy": ("#294b72", "#eaf0f7"),
-        "gold": ("#b87818", "#fff4df"), "rose": ("#b84e60", "#fdeff1"),
+        "teal": ("#1778ba", "#e6f1f8"), "navy": ("#0d3a5c", "#e6edf3"),
+        "gold": ("#c98a10", "#fff4d6"), "rose": ("#b84e60", "#fdeff1"),
     }
     accent, tint = colors[tone]
     st.markdown(
@@ -161,6 +184,16 @@ def apply_payee_history(history_key: str, payee_key: str, memo_key: str, categor
         st.session_state[treatment_key] = item["treatment"]
 
 
+def log_workspace_reconciliation(workspace: dict, business_id: int) -> None:
+    parsed = workspace["parsed"]
+    with db.connect(DB_PATH) as connection:
+        db.log_statement_reconciliation(
+            connection, business_id=business_id, account_id=int(workspace["account_id"]),
+            bank_name=parsed["bank"], account_last4=parsed["account_last4"],
+            statement_date=parsed["statement_date"], statement_file_name=workspace.get("statement_name"),
+            statement_check_total=float(parsed["check_total"]), statement_checks=parsed["checks"])
+
+
 def go_to_check_image(name: str) -> None:
     st.session_state["active_check_image"] = name
 
@@ -176,8 +209,9 @@ with db.connect(DB_PATH) as connection:
     businesses = db.list_businesses(connection)
 
 st.sidebar.markdown(
-    '<div class="brand"><div class="brand-mark">L</div><div><div class="brand-name">Ledgerly</div>'
-    '<div class="brand-sub">Business books</div></div></div>', unsafe_allow_html=True)
+    (f'<div class="brand"><div class="brand-logo"><img src="data:image/png;base64,{LOGO_B64}" alt="Rovar Infotech"/></div></div>'
+     if LOGO_B64 else '<div class="brand"><div class="brand-mark">R</div></div>')
+    + '<div class="brand-sub" style="margin:-.5rem 0 .9rem .2rem">Ledgerly · Business books</div>', unsafe_allow_html=True)
 nav = {
     "▦  Dashboard": "Dashboard", "↗  Revenue & expense": "Revenue & Expense",
     "▣  Tax prep": "Tax Prep",
@@ -187,11 +221,125 @@ nav = {
     "⌂  Vendors": "Vendors", "⌁  Categories & rules": "Categories & Rules",
     "◇  Accounts & credit": "Accounts & Credit",
     "⚙  Manage business": "Manage Business", "↓  Export & settings": "Export & Settings",
+    "🛡  Admin & backup": "Admin & Backup",
 }
 if st.session_state.get("nav_choice") not in nav:
     st.session_state["nav_choice"] = "▦  Dashboard"
 nav_choice = st.sidebar.radio("Navigation", list(nav), label_visibility="collapsed", key="nav_choice")
 page = nav[nav_choice]
+
+def render_admin() -> None:
+    page_header("Protect your books",
+                "Create, download and restore full-database backups. Backups cover every business in this database.",
+                "Admin")
+    admin_password = os.getenv("ADMIN_PASSWORD", "")
+    if admin_password and not st.session_state.get("admin_ok"):
+        with st.form("admin_login"):
+            entered = st.text_input("Admin password", type="password")
+            if st.form_submit_button("Unlock admin tools", type="primary"):
+                if hmac.compare_digest(entered.encode(), admin_password.encode()):
+                    st.session_state["admin_ok"] = True
+                    rerun()
+                else:
+                    st.error("That password is not correct.")
+        return
+    if not admin_password:
+        st.warning("No admin password is set, so anyone who can open this app can restore or delete backups. "
+                   "Set ADMIN_PASSWORD in your .env file and restart the container to lock these tools.")
+    else:
+        st.button("Lock admin tools", on_click=lambda: st.session_state.pop("admin_ok", None))
+
+    backups = backup.list_backups(DB_PATH)
+    live_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    m1, m2, m3 = st.columns(3)
+    with m1: metric_card("Backups kept", f"{len(backups)}", "Stored beside the database", "▤", "teal")
+    with m2: metric_card("Latest backup", backups[0]["created"].strftime("%b %d, %H:%M") if backups else "None yet",
+                         backups[0]["kind"] if backups else "Create one below", "◷", "gold")
+    with m3: metric_card("Database size", f"{live_size / 1024:,.0f} KB", str(DB_PATH.name), "$", "navy")
+
+    section_label("Create a backup")
+    c1, c2 = st.columns([1, 1])
+    if c1.button("Back up now", type="primary", width="stretch"):
+        created = backup.create_backup(DB_PATH, "manual")
+        st.session_state["admin_message"] = f"Backup saved: {created.name}"
+        rerun()
+    c2.download_button(
+        "Download a fresh backup", width="stretch",
+        data=lambda: backup.backup_path(DB_PATH, backup.create_backup(DB_PATH, "download").name).read_bytes(),
+        file_name=f"ledgerly-{date.today().isoformat()}.db", mime="application/octet-stream",
+        help="Takes a snapshot and downloads it, so you can keep a copy off this machine.")
+    if message := st.session_state.pop("admin_message", None):
+        st.success(message)
+    st.caption("An automatic backup is also taken the first time the app is opened each day; the 14 most recent "
+               "automatic backups are kept. Manual and pre-restore backups are never deleted automatically.")
+
+    section_label("Saved backups")
+    if backups:
+        st.dataframe(pd.DataFrame([{
+            "File": row["name"], "Type": row["kind"], "Created": row["created"].strftime("%Y-%m-%d %H:%M:%S"),
+            "Size (KB)": round(row["size"] / 1024, 1)} for row in backups]),
+            hide_index=True, width="stretch")
+        chosen_name = st.selectbox("Choose a backup", [row["name"] for row in backups], key="admin_backup_choice")
+        a1, a2, a3 = st.columns(3)
+        a1.download_button("Download", data=lambda: backup.backup_path(DB_PATH, chosen_name).read_bytes(),
+                           file_name=chosen_name, mime="application/octet-stream", width="stretch")
+        if a2.button("Restore this backup…", width="stretch"):
+            restore_dialog(chosen_name)
+        if a3.button("Delete…", width="stretch"):
+            delete_backup_dialog(chosen_name)
+    else:
+        st.caption("No backups yet.")
+
+    section_label("Restore from an uploaded file")
+    uploaded = st.file_uploader("A Ledgerly .db backup", type=["db", "sqlite", "sqlite3"], key="admin_restore_upload")
+    if uploaded is not None:
+        temp = backup.backup_dir(DB_PATH) / "upload.partial"
+        temp.write_bytes(uploaded.getvalue())
+        try:
+            counts = backup.validate_backup(temp)
+            st.info(f"Valid backup: {counts['businesses']} business(es), {counts['accounts']} accounts, "
+                    f"{counts['transactions']:,} transactions.")
+            if st.button("Restore from this file…"):
+                restore_dialog(None, upload_path=str(temp))
+        except ValueError as exc:
+            st.error(str(exc))
+            temp.unlink(missing_ok=True)
+
+
+@st.dialog("Restore this backup?")
+def restore_dialog(name: str | None, upload_path: str | None = None) -> None:
+    source = Path(upload_path) if upload_path else backup.backup_path(DB_PATH, name)
+    counts = backup.validate_backup(source)
+    st.write(f"This replaces **everything** in the live database with **{name or 'the uploaded file'}** "
+             f"({counts['businesses']} business(es), {counts['transactions']:,} transactions).")
+    st.caption("A safety backup of the current data is saved first, so this can be undone by restoring that one.")
+    yes, no = st.columns(2)
+    if yes.button("Restore", type="primary", width="stretch"):
+        safety = backup.restore_backup(DB_PATH, source)
+        db.init_db(DB_PATH)
+        if upload_path:
+            Path(upload_path).unlink(missing_ok=True)
+        st.session_state["admin_message"] = f"Restored. Previous data saved as {safety.name}."
+        rerun()
+    if no.button("Cancel", width="stretch"):
+        st.rerun()
+
+
+@st.dialog("Delete this backup?")
+def delete_backup_dialog(name: str) -> None:
+    st.write(f"Permanently delete **{name}**? This cannot be undone.")
+    yes, no = st.columns(2)
+    if yes.button("Delete", type="primary", width="stretch"):
+        backup.delete_backup(DB_PATH, name)
+        st.session_state["admin_message"] = f"Deleted {name}."
+        rerun()
+    if no.button("Cancel", width="stretch"):
+        st.rerun()
+
+
+if page == "Admin & Backup":
+    render_admin()
+    st.stop()
 
 if not businesses:
     st.title("Create your first business")
@@ -554,6 +702,7 @@ elif page == "Statements & Checks":
                     "account_id": int(account_by_name[selected_account_name]["id"]),
                     "account_name": selected_account_name,
                     "parsed": parsed,
+                    "statement_name": statement_file.name,
                     "image_sets": image_sets,
                 }
                 st.success(f"Detected {parsed['bank']}. Found {len(parsed['checks'])} cleared checks and {len(image_sets)} check image set(s).")
@@ -607,6 +756,15 @@ elif page == "Statements & Checks":
         with p2: metric_card("Still to map", money(listed_total - mapped_total), f"{len(unmapped_items)} checks", "◷", "gold")
         with p3: metric_card("Control total", money(float(parsed["check_total"])),
                              "Statement total", "$", "navy")
+        log_col, log_note = st.columns([1, 3])
+        if log_col.button("Log this statement", key="log_statement_now", width="stretch"):
+            log_workspace_reconciliation(workspace, business_id)
+            st.session_state["statement_log_message"] = "Statement logged for archiving."
+            rerun()
+        log_note.caption(f"Statement file: {workspace.get('statement_name') or 'unknown'} · "
+                         "logged automatically each time you confirm a check.")
+        if message := st.session_state.pop("statement_log_message", None):
+            st.success(message)
         if checks and abs(listed_total - float(parsed["check_total"])) >= 0.005:
             st.warning(f"The parsed checks add up to {money(listed_total)} but the statement says "
                        f"{money(float(parsed['check_total']))}. A check may not have been read — compare before relying on this list.")
@@ -828,11 +986,33 @@ elif page == "Statements & Checks":
                                     written_date=written_date.isoformat(), cleared_date=chosen["cleared_date"],
                                     payee=payee, memo=memo, category_id=category_id, treatment=treatment,
                                     source_file_name=active_image_name, check_type=check_type)
+                            log_workspace_reconciliation(workspace, business_id)
                             st.success(f"Check #{chosen['check_number']} was saved in the register.")
                             rerun()
         if st.button("Clear temporary PDF previews"):
             st.session_state.pop("statement_workspace", None)
             rerun()
+
+    section_label("Statement reconciliation log")
+    with db.connect(DB_PATH) as connection:
+        statement_log = db.list_statement_log(connection, business_id)
+        statement_log_rows = db.statement_log_rows(connection, business_id)
+    if statement_log:
+        log_frame = pd.DataFrame(statement_log).rename(columns={
+            "statement_file_name": "Statement file", "bank_name": "Bank", "account": "Account",
+            "account_last4": "Ending", "statement_date": "Statement date", "checks_listed": "Checks listed",
+            "checks_mapped": "Reconciled", "statement_check_total": "Statement total", "mapped_total": "Reconciled total",
+            "status": "Status", "first_logged_at": "First logged", "updated_at": "Last updated"}).drop(columns=["id"])
+        st.dataframe(log_frame, hide_index=True, width="stretch", column_config={
+            "Statement total": st.column_config.NumberColumn(format="$%.2f"),
+            "Reconciled total": st.column_config.NumberColumn(format="$%.2f")})
+        st.download_button(
+            "Download log with every check (CSV)", type="primary",
+            data=pd.DataFrame(statement_log_rows).to_csv(index=False).encode("utf-8"),
+            file_name=f"{db.slugify(business_name)}-statement-reconciliation-log.csv", mime="text/csv",
+            help="One row per check, with the statement file name, ready to archive next to the statement.")
+    else:
+        st.caption("Statements appear here once you confirm a check or press “Log this statement”.")
 
     section_label("Confirmed check register")
     with db.connect(DB_PATH) as connection:

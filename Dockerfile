@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY books ./books
 COPY streamlit_app.py ./
+COPY assets ./assets
 COPY .streamlit ./.streamlit
 RUN mkdir -p /app/data
 

@@ -10,3 +10,4 @@ data/*.sqlite*
 *.xlsx
 .DS_Store
 data/*.bak*
+data/backups/

@@ -756,6 +756,16 @@ elif page == "Statements & Checks":
         with p2: metric_card("Still to map", money(listed_total - mapped_total), f"{len(unmapped_items)} checks", "◷", "gold")
         with p3: metric_card("Control total", money(float(parsed["check_total"])),
                              "Statement total", "$", "navy")
+        month_start = f"{str(parsed['statement_date'])[:7]}-01"
+        with db.connect(DB_PATH) as connection:
+            pending_deposits = db.list_unreconciled_deposits(
+                connection, business_id, int(workspace["account_id"]), start=month_start,
+                end=str(parsed["statement_date"]))
+        if pending_deposits:
+            st.warning(
+                f"{len(pending_deposits)} credit(s) this month look like deposited checks "
+                f"({money(sum(float(d['signed_amount']) for d in pending_deposits))}) and have no check images "
+                "reconciled yet. Scroll to **Deposited checks** below.")
         log_col, log_note = st.columns([1, 3])
         if log_col.button("Log this statement", key="log_statement_now", width="stretch"):
             log_workspace_reconciliation(workspace, business_id)
@@ -992,6 +1002,108 @@ elif page == "Statements & Checks":
         if st.button("Clear temporary PDF previews"):
             st.session_state.pop("statement_workspace", None)
             rerun()
+
+    section_label("Deposited checks")
+    st.caption("Checks you deposited (money coming in). Pick the bank deposit, add the check images, and enter each "
+               "check — the amounts must add up to the deposit.")
+    deposit_account = account_by_name[selected_account_name]
+    dcol1, dcol2 = st.columns([1, 1])
+    with db.connect(DB_PATH) as connection:
+        all_credits = db.list_unreconciled_deposits(
+            connection, business_id, int(deposit_account["id"]), checks_only=False)
+    show_all_credits = dcol2.checkbox(
+        "Show every credit, not just ones that look like deposited checks", key="deposit_show_all",
+        help="ACH, wire and transfer credits are hidden by default.")
+    credits = all_credits if show_all_credits else [
+        row for row in all_credits if db.looks_like_check_deposit(row["description"])]
+    months = sorted({row["transaction_date"][:7] for row in credits}, reverse=True)
+    month_choice = dcol1.selectbox("Month", ["All months"] + months, key="deposit_month")
+    if month_choice != "All months":
+        credits = [row for row in credits if row["transaction_date"].startswith(month_choice)]
+    if not credits:
+        st.success("No unreconciled deposits for this account" + ("." if month_choice == "All months" else f" in {month_choice}."))
+    else:
+        st.dataframe(pd.DataFrame(credits).rename(columns={
+            "id": "Transaction #", "transaction_date": "Date", "description": "Description",
+            "signed_amount": "Amount", "treatment": "Treatment", "status": "Status"}),
+            hide_index=True, width="stretch",
+            column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+        credit_by_label = {
+            f"#{row['id']} · {row['transaction_date']} · {money(float(row['signed_amount']))} · {row['description'][:70]}": row
+            for row in credits}
+        deposit_label = st.selectbox("Deposit to reconcile", list(credit_by_label), key="deposit_choice")
+        deposit = credit_by_label[deposit_label]
+        deposit_id = int(deposit["id"])
+        image_column, entry_column = st.columns([1.1, 1], gap="large")
+        with image_column:
+            deposit_files = st.file_uploader(
+                "Images of the deposited checks (PDF, PNG or JPG)", type=["pdf", "png", "jpg", "jpeg"],
+                accept_multiple_files=True, key=f"deposit_files_{deposit_id}")
+            for uploaded in deposit_files or []:
+                st.caption(uploaded.name)
+                if uploaded.name.lower().endswith(".pdf"):
+                    pictures = statements.extract_check_images(uploaded.getvalue())[:2]
+                else:
+                    pictures = [uploaded.getvalue()]
+                if not pictures:
+                    st.info("No check image was found in that PDF.")
+                for index, picture in enumerate(pictures):
+                    st.image(picture, caption="Front" if index == 0 else "Back", width="stretch")
+        with entry_column:
+            st.markdown(f"#### Deposit of {money(float(deposit['signed_amount']))} on {deposit['transaction_date']}")
+            table_key = f"deposit_table_{deposit_id}"
+            file_names = [item.name for item in deposit_files or []]
+            starter = pd.DataFrame([{
+                "Check #": "", "Received from": "", "Amount": float(deposit["signed_amount"]),
+                "Memo": "", "Image file": file_names[0] if file_names else ""}])
+            edited = st.data_editor(
+                starter, key=table_key, num_rows="dynamic", hide_index=True, width="stretch",
+                column_config={
+                    "Amount": st.column_config.NumberColumn(format="$%.2f", min_value=0.0, step=0.01),
+                    "Image file": st.column_config.SelectboxColumn(options=[""] + file_names)})
+            entered = edited.dropna(subset=["Amount"])
+            entered_total = round(float(entered["Amount"].sum()), 2) if len(entered) else 0.0
+            difference = round(float(deposit["signed_amount"]) - entered_total, 2)
+            if abs(difference) < 0.005:
+                st.success(f"Checks add up to the deposit ({money(entered_total)}).")
+            else:
+                st.warning(f"Checks add up to {money(entered_total)}; "
+                           f"{money(abs(difference))} {'still to account for' if difference > 0 else 'too much'}.")
+            d_category_key = f"deposit_category_{deposit_id}"
+            d_treatment_key = f"deposit_treatment_{deposit_id}"
+            d_options = ["Uncategorized"] + list(category_by_name)
+            d_defaults = {"Uncategorized": "Revenue", **{
+                name: item["default_treatment"] for name, item in category_by_name.items()}}
+            st.session_state.setdefault(d_category_key, "Uncategorized")
+            st.session_state.setdefault(d_treatment_key, "Revenue")
+            st.selectbox("Category", d_options, key=d_category_key, on_change=sync_category_treatment,
+                         args=(d_category_key, d_treatment_key, d_defaults))
+            st.selectbox("Treatment", list(db.TREATMENTS), key=d_treatment_key,
+                         help="Revenue for customer payments. Use Receivable repayment when a loan you made is being repaid, "
+                              "or Loan draw if the money is a loan to you.")
+            if st.button("Confirm deposited checks", type="primary", width="stretch",
+                         disabled=abs(difference) >= 0.005 or not len(entered), key=f"deposit_confirm_{deposit_id}"):
+                d_category = st.session_state[d_category_key]
+                with db.connect(DB_PATH) as connection:
+                    try:
+                        db.confirm_deposit_checks(
+                            connection, business_id=business_id, account_id=int(deposit_account["id"]),
+                            transaction_id=deposit_id, bank_name=deposit_account.get("institution") or "",
+                            account_last4=deposit_account.get("last4") or "",
+                            deposited_checks=[{
+                                "check_number": str(row["Check #"] or ""), "payer": str(row["Received from"] or ""),
+                                "amount": float(row["Amount"]), "memo": str(row["Memo"] or ""),
+                                "image_file": str(row["Image file"] or "")}
+                                for _, row in entered.iterrows()],
+                            category_id=(int(category_by_name[d_category]["id"]) if d_category in category_by_name else None),
+                            treatment=st.session_state[d_treatment_key])
+                        st.session_state["deposit_message"] = f"Deposit #{deposit_id} reconciled with {len(entered)} check(s)."
+                    except ValueError as exc:
+                        st.error(str(exc))
+                        st.stop()
+                rerun()
+    if message := st.session_state.pop("deposit_message", None):
+        st.success(message)
 
     section_label("Statement reconciliation log")
     with db.connect(DB_PATH) as connection:

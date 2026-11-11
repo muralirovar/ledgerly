@@ -5,7 +5,7 @@ import json
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -1143,7 +1143,14 @@ def find_check_transaction_candidates(
 
 
 def reset_transaction_review(connection: sqlite3.Connection, transaction_id: int) -> None:
-    """Return a bank transaction to the review queue (used when a check link is removed)."""
+    """Return a bank transaction to the review queue (used when a check link is removed).
+
+    A deposit can hold several checks, so nothing is reset while another register entry still uses it.
+    """
+    if connection.execute(
+        "SELECT 1 FROM check_register WHERE transaction_id = ? LIMIT 1", (transaction_id,)
+    ).fetchone():
+        return
     now = utc_now()
     connection.execute(
         """UPDATE transactions SET category_id = NULL, treatment = 'Needs review',
@@ -1189,8 +1196,6 @@ def confirm_check(
            AND check_number=? AND cleared_date=? AND amount=?""",
         (business_id, account_id, check_number, cleared_date, amount),
     ).fetchone()
-    if previous and previous["transaction_id"] and previous["transaction_id"] != transaction_id:
-        reset_transaction_review(connection, int(previous["transaction_id"]))
     now = utc_now()
     cursor = connection.execute(
         """INSERT INTO check_register(
@@ -1212,6 +1217,8 @@ def confirm_check(
          check_type, payee.strip(), memo.strip(), category_id, treatment, source_file_name,
          now, now, now),
     )
+    if previous and previous["transaction_id"] and previous["transaction_id"] != transaction_id:
+        reset_transaction_review(connection, int(previous["transaction_id"]))
     if transaction_id and treatment:
         update_transaction_classification(
             connection, transaction_id, category_id=category_id, treatment=treatment,
@@ -1422,3 +1429,82 @@ def statement_log_rows(connection: sqlite3.Connection, business_id: int) -> list
            WHERE l.business_id = ?
            ORDER BY l.statement_date DESC, l.id DESC, CAST(k.check_number AS INTEGER)""",
         (business_id,))]
+
+
+_CHECK_DEPOSIT_HINT = re.compile(
+    r"counter\s*credit|deposit|check|chk|remote|rdc|lockbox|cash\s*letter|\bcredit\b", re.IGNORECASE)
+_NOT_A_CHECK = re.compile(r"\bACH\b|WIRE|ZELLE|\bCTX\b|\bPPD\b|\bCCD\b|DES:|INTEREST|ACCTVERIFY|TRANSFER", re.IGNORECASE)
+
+
+def looks_like_check_deposit(description: str) -> bool:
+    text = description or ""
+    return bool(_CHECK_DEPOSIT_HINT.search(text)) and not _NOT_A_CHECK.search(text)
+
+
+def list_unreconciled_deposits(
+    connection: sqlite3.Connection, business_id: int, account_id: int,
+    start: str | None = None, end: str | None = None, checks_only: bool = True,
+) -> list[dict[str, Any]]:
+    """Credits on an account that have no check-register entry yet."""
+    clauses = ["t.business_id = ?", "t.account_id = ?", "t.signed_amount > 0",
+               "NOT EXISTS (SELECT 1 FROM check_register r WHERE r.transaction_id = t.id)"]
+    params: list[Any] = [business_id, account_id]
+    if start:
+        clauses.append("t.transaction_date >= ?"); params.append(start)
+    if end:
+        clauses.append("t.transaction_date <= ?"); params.append(end)
+    rows = [dict(row) for row in connection.execute(
+        f"""SELECT t.id, t.transaction_date, t.description, t.signed_amount, t.treatment, t.status
+            FROM transactions t WHERE {' AND '.join(clauses)}
+            ORDER BY t.transaction_date, t.id""", params)]
+    if checks_only:
+        rows = [row for row in rows if looks_like_check_deposit(row["description"])]
+    return rows
+
+
+def confirm_deposit_checks(
+    connection: sqlite3.Connection,
+    *,
+    business_id: int,
+    account_id: int,
+    transaction_id: int,
+    bank_name: str,
+    account_last4: str,
+    deposited_checks: list[dict[str, Any]],
+    category_id: int | None,
+    treatment: str,
+) -> list[int]:
+    """Record the checks that made up one bank deposit and tie them to that transaction.
+
+    Each item needs ``amount`` and may carry ``check_number``, ``payer``, ``memo``, ``written_date``
+    and ``image_file``. The amounts must add up to the deposit exactly.
+    """
+    transaction = connection.execute(
+        "SELECT transaction_date, signed_amount FROM transactions WHERE id=? AND business_id=? AND account_id=?",
+        (transaction_id, business_id, account_id),
+    ).fetchone()
+    if transaction is None:
+        raise ValueError("That deposit does not belong to this business and account.")
+    deposit = round(float(transaction["signed_amount"]), 2)
+    if deposit <= 0:
+        raise ValueError("A deposit must be a credit (positive amount).")
+    if not deposited_checks:
+        raise ValueError("Add at least one deposited check.")
+    total = round(sum(float(item["amount"]) for item in deposited_checks), 2)
+    if abs(total - deposit) >= 0.005:
+        raise ValueError(f"The checks add up to ${total:,.2f} but the deposit is ${deposit:,.2f}.")
+    if any(float(item["amount"]) <= 0 for item in deposited_checks):
+        raise ValueError("Every check amount must be greater than zero.")
+    cleared = transaction["transaction_date"]
+    month_end = (datetime.strptime(cleared, "%Y-%m-%d").replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    ids = []
+    for position, item in enumerate(deposited_checks, start=1):
+        number = str(item.get("check_number") or "").strip() or f"DEP-{transaction_id}-{position}"
+        ids.append(confirm_check(
+            connection, business_id=business_id, account_id=account_id, transaction_id=transaction_id,
+            bank_name=bank_name, account_last4=account_last4, statement_date=month_end.date().isoformat(),
+            check_number=number, amount=float(item["amount"]), written_date=item.get("written_date"),
+            cleared_date=cleared, payee=str(item.get("payer") or ""), memo=str(item.get("memo") or ""),
+            category_id=category_id, treatment=treatment,
+            source_file_name=str(item.get("image_file") or ""), check_type="deposit"))
+    return ids

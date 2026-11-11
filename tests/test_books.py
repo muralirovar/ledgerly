@@ -326,6 +326,44 @@ class BooksTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIsNone(backup.maybe_daily_backup(self.path))  # already backed up today
 
+    def test_deposited_checks_reconciliation(self):
+        with db.connect(self.path) as connection:
+            deposit, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-04-08", posting_date=None,
+                description="Counter Credit", source_amount=8000, signed_amount=8000)
+            ach, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-04-09", posting_date=None,
+                description="Bill.com ACH CREDIT", source_amount=900, signed_amount=900)
+            pending = db.list_unreconciled_deposits(connection, self.business, self.account)
+            self.assertEqual([row["id"] for row in pending], [deposit])  # ACH is not a check deposit
+            self.assertEqual(len(db.list_unreconciled_deposits(
+                connection, self.business, self.account, checks_only=False)), 2)
+            with self.assertRaises(ValueError):  # must add up to the deposit
+                db.confirm_deposit_checks(
+                    connection, business_id=self.business, account_id=self.account, transaction_id=deposit,
+                    bank_name="BOA", account_last4="", category_id=None, treatment="Revenue",
+                    deposited_checks=[{"amount": 5000, "payer": "A"}])
+            ids = db.confirm_deposit_checks(
+                connection, business_id=self.business, account_id=self.account, transaction_id=deposit,
+                bank_name="BOA", account_last4="", category_id=None, treatment="Revenue",
+                deposited_checks=[{"amount": 5000, "payer": "Customer A", "check_number": "1201"},
+                                  {"amount": 3000, "payer": "Customer B"}])
+            self.assertEqual(len(ids), 2)
+            register = db.list_check_register(connection, self.business)
+            self.assertEqual({r["check_type"] for r in register}, {"deposit"})
+            self.assertEqual(sorted(r["amount"] for r in register), [3000.0, 5000.0])
+            self.assertEqual(db.get_transaction(connection, deposit)["treatment"], "Revenue")
+            self.assertEqual(db.list_unreconciled_deposits(connection, self.business, self.account), [])
+            # deleting one check keeps the deposit reconciled; deleting the last sends it back to review
+            self.assertTrue(db.delete_check_register_entry(
+                connection, business_id=self.business, check_id=ids[0], reset_transaction=True))
+            self.assertEqual(db.get_transaction(connection, deposit)["status"], "confirmed")
+            self.assertTrue(db.delete_check_register_entry(
+                connection, business_id=self.business, check_id=ids[1], reset_transaction=True))
+            self.assertEqual(db.get_transaction(connection, deposit)["status"], "needs_review")
+
     def test_loan_receivable_balance(self):
         self.assertIn("Loan receivable", db.TREATMENTS)
         with db.connect(self.path) as connection:

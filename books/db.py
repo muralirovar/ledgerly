@@ -1299,6 +1299,20 @@ def _payee_key(name: str, loose: bool = True) -> str:
     return " ".join(key.split())
 
 
+def known_parties(connection: sqlite3.Connection, business_id: int) -> list[str]:
+    """Every counterparty already on record (checks and transactions), one spelling each, A to Z."""
+    best: dict[str, str] = {}
+    for row in connection.execute(
+        """SELECT payee AS name FROM check_register WHERE business_id = ? AND TRIM(COALESCE(payee,'')) <> ''
+           UNION SELECT counterparty FROM transactions WHERE business_id = ? AND TRIM(COALESCE(counterparty,'')) <> ''""",
+        (business_id, business_id)):
+        name = row["name"].strip()
+        key = _payee_key(name)
+        if key not in best or len(name) > len(best[key]):
+            best[key] = name
+    return sorted(best.values(), key=str.lower)
+
+
 def payee_history(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
     """Distinct counterparties from the register with their most recent category/treatment/memo."""
     seen: dict[str, dict[str, Any]] = {}

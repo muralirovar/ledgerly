@@ -1126,25 +1126,65 @@ elif page == "Statements & Checks":
         statement_log = db.list_statement_log(connection, business_id)
         statement_log_rows = db.statement_log_rows(connection, business_id)
     if statement_log:
-        log_frame = pd.DataFrame(statement_log).rename(columns={
-            "statement_file_name": "Statement file", "bank_name": "Bank", "account": "Account",
-            "account_last4": "Ending", "statement_date": "Statement date", "checks_listed": "Checks listed",
-            "checks_mapped": "Reconciled", "statement_check_total": "Statement total", "mapped_total": "Reconciled total",
-            "status": "Status", "first_logged_at": "First logged", "updated_at": "Last updated"}).drop(columns=["id"])
-        st.dataframe(log_frame, hide_index=True, width="stretch", column_config={
-            "Statement total": st.column_config.NumberColumn(format="$%.2f"),
-            "Reconciled total": st.column_config.NumberColumn(format="$%.2f")})
-        st.download_button(
-            "Download log with every check (CSV)", type="primary",
-            data=pd.DataFrame(statement_log_rows).to_csv(index=False).encode("utf-8"),
-            file_name=f"{db.slugify(business_name)}-statement-reconciliation-log.csv", mime="text/csv",
-            help="One row per check, with the statement file name, ready to archive next to the statement.")
+        lf1, lf2, lf3, lf4 = st.columns([1.6, 1.2, 1, 1])
+        log_search = lf1.text_input("Search statements", key="log_search", placeholder="File name, bank, account…")
+        log_accounts = sorted({row["account"] for row in statement_log})
+        log_account = lf2.selectbox("Account", ["All accounts"] + log_accounts, key="log_account")
+        log_status = lf3.selectbox("Status", ["All"] + sorted({row["status"] for row in statement_log}), key="log_status")
+        log_years = sorted({str(row["statement_date"])[:4] for row in statement_log}, reverse=True)
+        log_year = lf4.selectbox("Year", ["All"] + log_years, key="log_year")
+        def log_match(row: dict, file_key: str, status_key: str) -> bool:
+            hay = " ".join(str(row.get(k) or "") for k in (file_key, "bank_name", "bank", "account", "account_last4")).lower()
+            return ((not log_search.strip() or log_search.strip().lower() in hay)
+                    and (log_account == "All accounts" or row["account"] == log_account)
+                    and (log_status == "All" or row[status_key] == log_status)
+                    and (log_year == "All" or str(row["statement_date"]).startswith(log_year)))
+        shown_log = [row for row in statement_log if log_match(row, "statement_file_name", "status")]
+        shown_log_rows = [row for row in statement_log_rows if log_match(row, "statement_file", "statement_status")]
+        st.caption(f"Showing {len(shown_log):,} of {len(statement_log):,} statements")
+        if shown_log:
+            log_frame = pd.DataFrame(shown_log).rename(columns={
+                "statement_file_name": "Statement file", "bank_name": "Bank", "account": "Account",
+                "account_last4": "Ending", "statement_date": "Statement date", "checks_listed": "Checks listed",
+                "checks_mapped": "Reconciled", "statement_check_total": "Statement total", "mapped_total": "Reconciled total",
+                "status": "Status", "first_logged_at": "First logged", "updated_at": "Last updated"}).drop(columns=["id"])
+            st.dataframe(log_frame, hide_index=True, width="stretch", column_config={
+                "Statement total": st.column_config.NumberColumn(format="$%.2f"),
+                "Reconciled total": st.column_config.NumberColumn(format="$%.2f")})
+            st.download_button(
+                "Download log with every check (CSV)", type="primary",
+                data=pd.DataFrame(shown_log_rows).to_csv(index=False).encode("utf-8"),
+                file_name=f"{db.slugify(business_name)}-statement-reconciliation-log.csv", mime="text/csv",
+                help="One row per check for the statements shown above, ready to archive next to the statement.")
+        else:
+            st.info("No statements match these filters.")
     else:
         st.caption("Statements appear here once you confirm a check or press “Log this statement”.")
 
     section_label("Confirmed check register")
     with db.connect(DB_PATH) as connection:
         register = db.list_check_register(connection, business_id)
+    total_register = len(register)
+    if register:
+        rf1, rf2, rf3, rf4, rf5 = st.columns([1.5, 1, 1, 1, 1])
+        reg_search = rf1.text_input("Search checks", key="reg_search", placeholder="Check #, payee, memo, amount…")
+        reg_account = rf2.selectbox("Account", ["All accounts"] + sorted({r["account"] for r in register}), key="reg_account")
+        reg_dir = rf3.selectbox("Direction", ["All", "Payments", "Deposits"], key="reg_dir")
+        reg_treat = rf4.selectbox("Treatment", ["All"] + sorted({r["treatment"] for r in register if r["treatment"]}), key="reg_treat")
+        reg_year = rf5.selectbox("Year", ["All"] + sorted({str(r["cleared_date"])[:4] for r in register}, reverse=True), key="reg_year")
+        needle = reg_search.strip().lower().replace(",", "").replace("$", "")
+        def reg_match(r: dict) -> bool:
+            hay = " ".join(str(r.get(k) or "") for k in (
+                "check_number", "payee", "memo", "account", "category", "treatment", "source_file_name")).lower()
+            hay += f" {float(r['amount']):.2f} {int(float(r['amount']))}"
+            return ((not needle or needle in hay)
+                    and (reg_account == "All accounts" or r["account"] == reg_account)
+                    and (reg_dir == "All" or r["check_type"] == ("payment" if reg_dir == "Payments" else "deposit"))
+                    and (reg_treat == "All" or r["treatment"] == reg_treat)
+                    and (reg_year == "All" or str(r["cleared_date"]).startswith(reg_year)))
+        register = [r for r in register if reg_match(r)]
+        grid_key = f"check_register_grid_{abs(hash((reg_search, reg_account, reg_dir, reg_treat, reg_year)))}"
+        st.caption(f"Showing {len(register):,} of {total_register:,} checks · {money(sum(float(r['amount']) for r in register))}")
     if register:
         register_frame = pd.DataFrame(register).rename(columns={
             "cleared_date": "Cleared", "written_date": "Written", "check_number": "Check #",
@@ -1174,7 +1214,7 @@ elif page == "Statements & Checks":
                     db.delete_check_register_entry(
                         connection, business_id=business_id, check_id=int(selected_check["id"]),
                         reset_transaction=reset_linked)
-                st.session_state.pop("check_register_grid", None)
+                st.session_state.pop(grid_key, None)
                 rerun()
             if no.button("Cancel", width="stretch"):
                 st.rerun()
@@ -1183,12 +1223,14 @@ elif page == "Statements & Checks":
         grid = st.dataframe(
             register_frame[["Cleared", "Written", "Check #", "Direction", "Amount", "Counterparty", "Memo", "Bank",
                             "Account", "Category", "Treatment", "Transaction #", "Source file"]],
-            hide_index=True, width="stretch", key="check_register_grid",
+            hide_index=True, width="stretch", key=grid_key,
             on_select="rerun", selection_mode="single-row",
             column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
         selected_rows = grid.selection.rows
         if st.button("🗑  Delete selected check", disabled=not selected_rows, key="delete_check_register_button"):
             confirm_delete_dialog(register[selected_rows[0]])
+    elif total_register:
+        st.info("No checks match these filters.")
     else:
         st.caption("No checks have been confirmed yet.")
 
@@ -1266,7 +1308,18 @@ elif page == "Deposits":
                   "Transfer": "Transferred from", "Owner contribution": "Contributed by",
                   "Receivable repayment": "Repaid by", "Revenue refund": "Refund paid to",
                   "Expense refund": "Refund received from", "Excluded": "Source (optional)"}
-        counterparty = c2.text_input(labels[treatment], key=f"dep_party_{treatment}")
+        is_loan = treatment in ("Loan draw", "Receivable repayment")
+        with db.connect(DB_PATH) as connection:
+            party_names = db.known_parties(connection, business_id)
+        if is_loan:
+            heading = ("Loan FROM (lender who gave you this money)" if treatment == "Loan draw"
+                       else "Loan TO (borrower repaying you)")
+            c2.markdown(f"**{heading}**")
+            party_pick = c2.selectbox("Choose existing party", ["＋ New name…"] + party_names, key=f"dep_party_pick_{treatment}")
+            counterparty = (c2.text_input("New party name", key=f"dep_party_new_{treatment}")
+                            if party_pick == "＋ New name…" else party_pick)
+        else:
+            counterparty = c2.text_input(labels[treatment], key=f"dep_party_{treatment}")
         category_id = None
         related_id = None
         if treatment == "Revenue":

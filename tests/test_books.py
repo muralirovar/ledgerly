@@ -581,6 +581,31 @@ class BooksTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 db.rename_party(connection, business_id=self.business, old_names=["Bank Lender"], new_name=" ")
 
+    def test_personal_tax_prep_items(self):
+        with db.connect(self.path) as connection:
+            charity_id = db.add_personal_tax_item(
+                connection, tax_year=2026, category="Charity", document_type="Charity receipt",
+                name="UNICEF", amount=250, status="Received", notes="Online receipt")
+            db.add_personal_tax_item(
+                connection, tax_year=2025, category="Employment income", document_type="W-2",
+                name="Johns Hopkins", amount=100000, status="Entered")
+            items = db.list_personal_tax_items(connection, tax_year=2026)
+            self.assertEqual(len(items), 1)
+            self.assertEqual((items[0]["name"], items[0]["amount"]), ("UNICEF", 250.0))
+            self.assertTrue(db.update_personal_tax_item(
+                connection, item_id=charity_id, tax_year=2026, category="Charity",
+                document_type="Charity receipt", name="UNICEF USA", amount=275,
+                status="Entered", notes="Final receipt"))
+            updated = db.list_personal_tax_items(connection, tax_year=2026)[0]
+            self.assertEqual((updated["name"], updated["amount"], updated["status"]),
+                             ("UNICEF USA", 275.0, "Entered"))
+            self.assertTrue(db.delete_personal_tax_item(connection, item_id=charity_id))
+            self.assertEqual(db.list_personal_tax_items(connection, tax_year=2026), [])
+            with self.assertRaises(ValueError):
+                db.add_personal_tax_item(
+                    connection, tax_year=2026, category="Charity", document_type="Charity receipt",
+                    name="", amount=10)
+
 
 if __name__ == "__main__":
     unittest.main()

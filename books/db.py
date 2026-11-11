@@ -261,6 +261,22 @@ CREATE TABLE IF NOT EXISTS vendors (
     UNIQUE(business_id, match_pattern)
 );
 
+CREATE TABLE IF NOT EXISTS personal_tax_items (
+    id INTEGER PRIMARY KEY,
+    tax_year INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    document_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    amount REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'Expected',
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_personal_tax_items_year
+ON personal_tax_items(tax_year, category, document_type);
+
 CREATE TABLE IF NOT EXISTS check_register (
     id INTEGER PRIMARY KEY,
     business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
@@ -1111,6 +1127,84 @@ def set_setting(connection: sqlite3.Connection, key: str, value: str) -> None:
            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
         (key, value, utc_now()),
     )
+
+
+def add_personal_tax_item(
+    connection: sqlite3.Connection,
+    *,
+    tax_year: int,
+    category: str,
+    document_type: str,
+    name: str,
+    amount: float = 0,
+    status: str = "Expected",
+    notes: str = "",
+) -> int:
+    if tax_year < 1900 or tax_year > 2200:
+        raise ValueError("Enter a valid tax year.")
+    if not category.strip() or not document_type.strip() or not name.strip():
+        raise ValueError("Category, document type, and name are required.")
+    if amount < 0:
+        raise ValueError("Amount cannot be negative.")
+    now = utc_now()
+    cursor = connection.execute(
+        """INSERT INTO personal_tax_items(
+               tax_year, category, document_type, name, amount, status, notes, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (int(tax_year), category.strip(), document_type.strip(), name.strip(), float(amount),
+         status.strip() or "Expected", notes.strip(), now, now),
+    )
+    return int(cursor.lastrowid)
+
+
+def list_personal_tax_items(
+    connection: sqlite3.Connection, *, tax_year: int | None = None,
+) -> list[dict[str, Any]]:
+    if tax_year is None:
+        rows = connection.execute(
+            """SELECT * FROM personal_tax_items
+               ORDER BY tax_year DESC, category, document_type, name, id"""
+        )
+    else:
+        rows = connection.execute(
+            """SELECT * FROM personal_tax_items WHERE tax_year = ?
+               ORDER BY category, document_type, name, id""",
+            (int(tax_year),),
+        )
+    return [dict(row) for row in rows]
+
+
+def update_personal_tax_item(
+    connection: sqlite3.Connection,
+    *,
+    item_id: int,
+    tax_year: int,
+    category: str,
+    document_type: str,
+    name: str,
+    amount: float,
+    status: str,
+    notes: str = "",
+) -> bool:
+    if tax_year < 1900 or tax_year > 2200:
+        raise ValueError("Enter a valid tax year.")
+    if not category.strip() or not document_type.strip() or not name.strip():
+        raise ValueError("Category, document type, and name are required.")
+    if amount < 0:
+        raise ValueError("Amount cannot be negative.")
+    cursor = connection.execute(
+        """UPDATE personal_tax_items
+           SET tax_year=?, category=?, document_type=?, name=?, amount=?, status=?, notes=?, updated_at=?
+           WHERE id=?""",
+        (int(tax_year), category.strip(), document_type.strip(), name.strip(), float(amount),
+         status.strip() or "Expected", notes.strip(), utc_now(), int(item_id)),
+    )
+    return cursor.rowcount > 0
+
+
+def delete_personal_tax_item(connection: sqlite3.Connection, *, item_id: int) -> bool:
+    cursor = connection.execute("DELETE FROM personal_tax_items WHERE id = ?", (item_id,))
+    return cursor.rowcount > 0
 
 
 def _check_number_in(description: str, check_number: str) -> bool:

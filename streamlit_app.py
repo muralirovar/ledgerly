@@ -26,6 +26,18 @@ if "daily_backup_checked" not in st.session_state:  # automatic daily snapshot, 
 
 ASSETS_DIR = APP_DIR / "assets"
 
+PERSONAL_TAX_CATEGORIES = (
+    "Charity", "Employment income", "Interest income", "Dividend income", "Other income",
+    "Mortgage", "Property tax", "Investments", "Retirement", "Education / 529",
+    "K-1 / business", "State tax", "Other",
+)
+PERSONAL_TAX_DOCUMENT_TYPES = (
+    "Charity receipt", "W-2", "1099-INT", "1099-DIV", "1099-MISC", "1099-NEC",
+    "1099-R", "1098 mortgage interest", "K-1", "Brokerage statement",
+    "Property tax statement", "State tax refund", "529 statement", "Other",
+)
+PERSONAL_TAX_STATUSES = ("Expected", "Received", "Entered", "Not applicable")
+
 
 def _asset_b64(name: str) -> str:
     try:
@@ -205,6 +217,174 @@ def sync_check_direction(check_type_key: str, category_key: str, treatment_key: 
         )
 
 
+def render_personal_tax_prep() -> None:
+    page_header(
+        "Personal tax preparation",
+        "Keep a year-by-year checklist of personal tax documents and amounts, separate from every business ledger.",
+        "Personal tax prep sheet",
+    )
+    with db.connect(DB_PATH) as connection:
+        all_items = db.list_personal_tax_items(connection)
+    current_year = date.today().year
+    available_years = sorted(
+        {current_year, current_year - 1, *(int(item["tax_year"]) for item in all_items)}, reverse=True)
+    selected_year = st.selectbox("Tax year", available_years, key="personal_tax_year")
+
+    with st.expander("Add a tax-prep item", expanded=not bool(all_items)):
+        with st.form("add_personal_tax_item", clear_on_submit=True):
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                add_category = st.selectbox("Category", PERSONAL_TAX_CATEGORIES)
+                custom_category = st.text_input("Custom category (optional)")
+            with a2:
+                add_document_type = st.selectbox("Document type", PERSONAL_TAX_DOCUMENT_TYPES)
+                custom_document_type = st.text_input("Custom document type (optional)")
+            with a3:
+                add_status = st.selectbox("Status", PERSONAL_TAX_STATUSES)
+                add_amount = st.number_input("Amount", min_value=0.0, step=100.0, format="%.2f")
+            add_name = st.text_input(
+                "Name / payer / charity",
+                placeholder="Example: Johns Hopkins, UNICEF, Vanguard, mortgage lender",
+            )
+            add_notes = st.text_area("Notes", placeholder="Optional document details or follow-up")
+            add_submitted = st.form_submit_button("Add to personal tax prep", type="primary")
+            if add_submitted:
+                try:
+                    with db.connect(DB_PATH) as connection:
+                        db.add_personal_tax_item(
+                            connection,
+                            tax_year=int(selected_year),
+                            category=custom_category.strip() or add_category,
+                            document_type=custom_document_type.strip() or add_document_type,
+                            name=add_name,
+                            amount=float(add_amount),
+                            status=add_status,
+                            notes=add_notes,
+                        )
+                    st.success("Personal tax-prep item added.")
+                    rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+    with db.connect(DB_PATH) as connection:
+        year_items = db.list_personal_tax_items(connection, tax_year=int(selected_year))
+    year_frame = pd.DataFrame(year_items)
+    if year_frame.empty:
+        st.info(f"No personal tax-prep items have been added for {selected_year}.")
+        return
+
+    section_label("Filter the prep sheet")
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        category_filter = st.multiselect(
+            "Categories", sorted(year_frame["category"].unique()), placeholder="All categories")
+    with f2:
+        type_filter = st.multiselect(
+            "Document types", sorted(year_frame["document_type"].unique()), placeholder="All document types")
+    with f3:
+        status_filter = st.multiselect(
+            "Statuses", list(PERSONAL_TAX_STATUSES), placeholder="All statuses")
+    filtered = year_frame.copy()
+    if category_filter:
+        filtered = filtered[filtered["category"].isin(category_filter)]
+    if type_filter:
+        filtered = filtered[filtered["document_type"].isin(type_filter)]
+    if status_filter:
+        filtered = filtered[filtered["status"].isin(status_filter)]
+
+    total_amount = float(filtered["amount"].sum()) if not filtered.empty else 0.0
+    received = int(filtered["status"].isin(["Received", "Entered"]).sum()) if not filtered.empty else 0
+    expected = int((filtered["status"] == "Expected").sum()) if not filtered.empty else 0
+    m1, m2, m3, m4 = st.columns(4)
+    with m1: metric_card("Items", f"{len(filtered):,}", f"Tax year {selected_year}", "▤", "navy")
+    with m2: metric_card("Recorded amount", money(total_amount), "Filtered sheet total", "$", "teal")
+    with m3: metric_card("Received / entered", f"{received:,}", "Documents in hand", "✓", "gold")
+    with m4: metric_card("Still expected", f"{expected:,}", "Follow-up list", "?", "rose")
+
+    section_label("Personal tax prep sheet")
+    display = filtered.rename(columns={
+        "tax_year": "Year", "category": "Category", "document_type": "Type",
+        "name": "Name / payer / charity", "amount": "Amount", "status": "Status", "notes": "Notes",
+    })
+    st.dataframe(
+        display[["Year", "Category", "Type", "Name / payer / charity", "Amount", "Status", "Notes"]],
+        hide_index=True, width="stretch",
+        column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
+    )
+    summary = filtered.groupby("category", as_index=False).agg(Items=("id", "count"), Amount=("amount", "sum"))
+    summary = summary.rename(columns={"category": "Category"}).sort_values("Amount", ascending=False)
+    with st.expander("Category totals"):
+        st.dataframe(
+            summary, hide_index=True, width="stretch",
+            column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
+        )
+
+    action1, action2 = st.columns(2)
+    with action1:
+        export_columns = ["tax_year", "category", "document_type", "name", "amount", "status", "notes"]
+        st.download_button(
+            "Download filtered sheet as CSV",
+            data=filtered[export_columns].to_csv(index=False).encode("utf-8"),
+            file_name=f"personal-tax-prep-{selected_year}.csv",
+            mime="text/csv", width="stretch",
+        )
+    with action2:
+        st.caption("This is an organization sheet, not tax advice. Confirm tax treatment with your tax professional.")
+
+    with st.expander("Update or delete an item"):
+        record_by_label = {
+            f"{item['category']} · {item['document_type']} · {item['name']} · ID {item['id']}": item
+            for item in year_items
+        }
+        record_label = st.selectbox("Item", list(record_by_label), key="personal_tax_edit_choice")
+        record = record_by_label[record_label]
+        item_id = int(record["id"])
+        category_options = list(dict.fromkeys([*PERSONAL_TAX_CATEGORIES, str(record["category"])]))
+        document_options = list(dict.fromkeys([*PERSONAL_TAX_DOCUMENT_TYPES, str(record["document_type"])]))
+        with st.form(f"edit_personal_tax_{item_id}"):
+            e1, e2, e3 = st.columns(3)
+            with e1:
+                edit_category = st.selectbox(
+                    "Category", category_options, index=category_options.index(str(record["category"])))
+                edit_year = st.number_input("Year", min_value=1900, max_value=2200, value=int(record["tax_year"]))
+            with e2:
+                edit_document = st.selectbox(
+                    "Document type", document_options, index=document_options.index(str(record["document_type"])))
+                edit_status = st.selectbox(
+                    "Status", PERSONAL_TAX_STATUSES,
+                    index=list(PERSONAL_TAX_STATUSES).index(str(record["status"]))
+                    if str(record["status"]) in PERSONAL_TAX_STATUSES else 0)
+            with e3:
+                edit_name = st.text_input("Name / payer / charity", value=str(record["name"]))
+                edit_amount = st.number_input(
+                    "Amount", min_value=0.0, value=float(record["amount"]), step=100.0, format="%.2f")
+            edit_notes = st.text_area("Notes", value=str(record.get("notes") or ""))
+            if st.form_submit_button("Save changes", type="primary"):
+                try:
+                    with db.connect(DB_PATH) as connection:
+                        db.update_personal_tax_item(
+                            connection, item_id=item_id, tax_year=int(edit_year), category=edit_category,
+                            document_type=edit_document, name=edit_name, amount=float(edit_amount),
+                            status=edit_status, notes=edit_notes)
+                    st.success("Personal tax-prep item updated.")
+                    rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+        confirm_delete = st.checkbox(
+            "I confirm that I want to permanently delete this personal tax-prep item.",
+            key=f"confirm_delete_personal_tax_{item_id}")
+        if st.button(
+            "Delete selected item", disabled=not confirm_delete,
+            key=f"delete_personal_tax_{item_id}"):
+            with db.connect(DB_PATH) as connection:
+                deleted = db.delete_personal_tax_item(connection, item_id=item_id)
+            if deleted:
+                st.success("Personal tax-prep item deleted.")
+                rerun()
+            else:
+                st.error("That item could not be found.")
+
+
 with db.connect(DB_PATH) as connection:
     businesses = db.list_businesses(connection)
 
@@ -214,7 +394,7 @@ st.sidebar.markdown(
     + '<div class="brand-sub" style="margin:-.5rem 0 .9rem .2rem">Ledgerly · Business books</div>', unsafe_allow_html=True)
 nav = {
     "▦  Dashboard": "Dashboard", "↗  Revenue & expense": "Revenue & Expense",
-    "▣  Tax prep": "Tax Prep",
+    "▣  Tax prep": "Tax Prep", "♙  Personal tax prep": "Personal Tax Prep",
     "⇧  Import transactions": "Import / Paste",
     "▤  Statements & checks": "Statements & Checks",
     "＄  Deposits": "Deposits", "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
@@ -339,6 +519,10 @@ def delete_backup_dialog(name: str) -> None:
 
 if page == "Admin & Backup":
     render_admin()
+    st.stop()
+
+if page == "Personal Tax Prep":
+    render_personal_tax_prep()
     st.stop()
 
 if not businesses:

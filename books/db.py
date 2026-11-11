@@ -1642,7 +1642,7 @@ def suggest_transfer_counterpart(
     if txn is None:
         return None
     leg = connection.execute(
-        """SELECT t.transaction_date, t.account_id, a.name AS account_name
+        """SELECT t.id, t.transaction_date, t.account_id, a.name AS account_name
            FROM transactions t JOIN accounts a ON a.id = t.account_id
            WHERE t.business_id = ? AND t.account_id <> ? AND ABS(t.signed_amount + ?) < 0.005
              AND ABS(julianday(t.transaction_date) - julianday(?)) <= 7
@@ -1652,7 +1652,7 @@ def suggest_transfer_counterpart(
          txn["transaction_date"])).fetchone()
     if leg:
         return {"related_account_id": int(leg["account_id"]), "related_account_name": leg["account_name"],
-                "counterparty": leg["account_name"],
+                "counterparty": leg["account_name"], "transaction_id": int(leg["id"]),
                 "reason": f"Matching {abs(float(txn['signed_amount'])):,.2f} on {leg['transaction_date']} in {leg['account_name']}"}
     pattern = suggested_vendor_pattern(txn["description"])
     if len(pattern) >= 6:
@@ -1669,6 +1669,88 @@ def suggest_transfer_counterpart(
             return {"related_account_id": row["related_account_id"], "related_account_name": row["account_name"],
                     "counterparty": row["counterparty"] or row["account_name"] or "",
                     "reason": f"Recorded this way on {row['n']} earlier similar transfer(s)"}
+    return None
+
+
+def suggest_deposit_check_details(
+    connection: sqlite3.Connection, business_id: int, transaction_id: int,
+) -> dict[str, Any]:
+    """Pre-fill for the deposited-check form: check number, who it came from, memo, category, treatment.
+
+    An opposite entry in another account (an internal transfer) wins, and brings the check number
+    of the check written on that account. Otherwise the most recent earlier deposit with the same
+    bank description is used.
+    """
+    txn = connection.execute(
+        "SELECT description, normalized_description FROM transactions WHERE id = ? AND business_id = ?",
+        (transaction_id, business_id)).fetchone()
+    if txn is None:
+        return {}
+    guess = suggest_transfer_counterpart(connection, business_id, transaction_id)
+    if guess and guess.get("transaction_id"):
+        linked = connection.execute(
+            """SELECT r.check_number, r.payee, r.memo FROM check_register r
+               WHERE r.transaction_id = ? AND r.check_type = 'payment' ORDER BY r.id LIMIT 1""",
+            (guess["transaction_id"],)).fetchone()
+        return {
+            "check_number": linked["check_number"] if linked else "",
+            "payer": guess["related_account_name"],
+            "memo": (linked["memo"] if linked else "") or "Internal transfer",
+            "category": "Internal transfer", "treatment": "Transfer",
+            "reason": guess["reason"] + (f" (check #{linked['check_number']})" if linked else ""),
+        }
+    previous = connection.execute(
+        """SELECT r.payee, r.memo, r.treatment, c.name AS category
+           FROM check_register r JOIN transactions t ON t.id = r.transaction_id
+           LEFT JOIN categories c ON c.id = r.category_id
+           WHERE r.business_id = ? AND r.check_type = 'deposit' AND t.id <> ?
+             AND t.normalized_description = ? AND TRIM(COALESCE(r.payee, '')) <> ''
+           ORDER BY r.cleared_date DESC, r.id DESC LIMIT 1""",
+        (business_id, transaction_id, txn["normalized_description"])).fetchone()
+    if previous:
+        return {"check_number": "", "payer": previous["payee"], "memo": previous["memo"] or "",
+                "category": previous["category"], "treatment": previous["treatment"],
+                "reason": "Same as an earlier deposit with this description"}
+    return {}
+
+
+def last_deposit_details(
+    connection: sqlite3.Connection, business_id: int, *, treatment: str,
+    category: str | None = None, exclude_transaction_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Details of the most recent earlier deposit recorded with this treatment (and category).
+
+    Looks at deposited checks first, then at bank transactions, so a Transfer or Internal transfer
+    selection can offer who it came from and the memo used last time.
+    """
+    clauses = ["r.business_id = ?", "r.check_type = 'deposit'", "r.treatment = ?"]
+    params: list[Any] = [business_id, treatment]
+    if category:
+        clauses.append("c.name = ?"); params.append(category)
+    if exclude_transaction_id:
+        clauses.append("COALESCE(r.transaction_id, 0) <> ?"); params.append(exclude_transaction_id)
+    row = connection.execute(
+        f"""SELECT r.check_number, r.payee, r.memo, r.cleared_date, r.amount, c.name AS category
+            FROM check_register r LEFT JOIN categories c ON c.id = r.category_id
+            WHERE {' AND '.join(clauses)} AND TRIM(COALESCE(r.payee, '')) <> ''
+            ORDER BY r.cleared_date DESC, r.id DESC LIMIT 1""", params).fetchone()
+    if row:
+        return {"payer": row["payee"], "memo": row["memo"] or "", "check_number": "",
+                "reason": f"last {treatment.lower()} deposit: {row['cleared_date']}, ${float(row['amount']):,.2f}"}
+    clauses = ["t.business_id = ?", "t.signed_amount > 0", "t.treatment = ?", "t.status = 'confirmed'",
+               "TRIM(COALESCE(t.counterparty, '')) <> ''"]
+    params = [business_id, treatment]
+    if category:
+        clauses.append("c.name = ?"); params.append(category)
+    if exclude_transaction_id:
+        clauses.append("t.id <> ?"); params.append(exclude_transaction_id)
+    row = connection.execute(
+        f"""SELECT t.counterparty, t.notes, t.transaction_date, t.signed_amount
+            FROM transactions t LEFT JOIN categories c ON c.id = t.category_id
+            WHERE {' AND '.join(clauses)} ORDER BY t.transaction_date DESC, t.id DESC LIMIT 1""", params).fetchone()
+    if row:
+        return {"payer": row["counterparty"], "memo": row["notes"] or "", "check_number": "",
+                "reason": f"last {treatment.lower()} transaction: {row['transaction_date']}, ${float(row['signed_amount']):,.2f}"}
     return None
 
 

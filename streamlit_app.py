@@ -1067,11 +1067,21 @@ elif page == "Statements & Checks":
                     st.image(picture, caption="Front" if index == 0 else "Back", width="stretch")
         with entry_column:
             st.markdown(f"#### Deposit of {money(float(deposit['signed_amount']))} on {deposit['transaction_date']}")
-            table_key = f"deposit_table_{deposit_id}"
+            seed_key = f"deposit_seed_{deposit_id}"
+            table_key = f"deposit_table_{deposit_id}_{st.session_state.get(seed_key, {}).get('version', 0)}"
             file_names = [item.name for item in deposit_files or []]
+            with db.connect(DB_PATH) as connection:
+                prefill = db.suggest_deposit_check_details(connection, business_id, deposit_id)
             starter = pd.DataFrame([{
-                "Check #": "", "Received from": "", "Amount": float(deposit["signed_amount"]),
-                "Memo": "", "Image file": file_names[0] if file_names else ""}])
+                "Check #": prefill.get("check_number") or "", "Received from": prefill.get("payer") or "",
+                "Amount": float(deposit["signed_amount"]),
+                "Memo": prefill.get("memo") or "", "Image file": file_names[0] if file_names else ""}])
+            seed = st.session_state.get(seed_key)
+            if seed:
+                starter.loc[0, ["Check #", "Received from", "Memo"]] = [
+                    seed.get("check_number") or "", seed["payer"], seed["memo"]]
+            if prefill:
+                st.caption(f"Pre-filled from your records: {prefill['reason']}. Edit anything that is not right.")
             edited = st.data_editor(
                 starter, key=table_key, num_rows="dynamic", hide_index=True, width="stretch",
                 column_config={
@@ -1090,13 +1100,33 @@ elif page == "Statements & Checks":
             d_options = ["Uncategorized"] + list(category_by_name)
             d_defaults = {"Uncategorized": "Revenue", **{
                 name: item["default_treatment"] for name, item in category_by_name.items()}}
-            st.session_state.setdefault(d_category_key, "Uncategorized")
-            st.session_state.setdefault(d_treatment_key, "Revenue")
+            st.session_state.setdefault(
+                d_category_key, prefill.get("category") if prefill.get("category") in category_by_name else "Uncategorized")
+            st.session_state.setdefault(
+                d_treatment_key, prefill.get("treatment") if prefill.get("treatment") in db.TREATMENTS else "Revenue")
             st.selectbox("Category", d_options, key=d_category_key, on_change=sync_category_treatment,
                          args=(d_category_key, d_treatment_key, d_defaults))
             st.selectbox("Treatment", list(db.TREATMENTS), key=d_treatment_key,
                          help="Revenue for customer payments. Use Receivable repayment when a loan you made is being repaid, "
                               "or Loan draw if the money is a loan to you.")
+            chosen_treatment = st.session_state[d_treatment_key]
+            chosen_category = st.session_state[d_category_key]
+            if chosen_treatment != "Revenue" or chosen_category == "Internal transfer":
+                with db.connect(DB_PATH) as connection:
+                    last_details = (db.last_deposit_details(
+                        connection, business_id, treatment=chosen_treatment,
+                        category=chosen_category if chosen_category in category_by_name else None,
+                        exclude_transaction_id=deposit_id)
+                        or db.last_deposit_details(connection, business_id, treatment=chosen_treatment,
+                                                   exclude_transaction_id=deposit_id))
+                if last_details:
+                    with st.container(border=True):
+                        st.markdown(f"**Use details from the {last_details['reason']}?**")
+                        st.caption(f"Received from: {last_details['payer'] or '—'} · Memo: {last_details['memo'] or '—'}")
+                        if st.button("Fill the table with these details", key=f"deposit_fill_{deposit_id}"):
+                            st.session_state[seed_key] = {
+                                **last_details, "version": st.session_state.get(seed_key, {}).get("version", 0) + 1}
+                            rerun()
             if st.button("Confirm deposited checks", type="primary", width="stretch",
                          disabled=abs(difference) >= 0.005 or not len(entered), key=f"deposit_confirm_{deposit_id}"):
                 d_category = st.session_state[d_category_key]

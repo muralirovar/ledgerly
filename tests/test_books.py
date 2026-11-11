@@ -531,6 +531,7 @@ class BooksTests(unittest.TestCase):
                                  treatment="Transfer", fill_transfer_from_records=True)
             row = connection.execute("SELECT related_account_id, counterparty FROM transactions WHERE id=?", (dep,)).fetchone()
             self.assertEqual((row["related_account_id"], row["counterparty"]), (other, "Savings"))
+            self.assertEqual(db.suggest_deposit_check_details(connection, self.business, dep)["treatment"], "Transfer")
             later, _, _ = db.insert_transaction(
                 connection, business_id=self.business, account_id=self.account, transaction_date="2026-08-02",
                 posting_date=None, description="ATM DEPOSIT", source_amount=700, signed_amount=700)
@@ -546,6 +547,11 @@ class BooksTests(unittest.TestCase):
                              (1, 700.0, "Deposits only"))
             rows = db.statement_log_rows(connection, self.business)
             self.assertEqual([(r["direction"], r["check_number"], r["amount"]) for r in rows], [("deposit", "55", 700.0)])
+            # last-transaction details for a Transfer selection come from the bank transaction's counterparty
+            last = db.last_deposit_details(connection, self.business, treatment="Transfer", exclude_transaction_id=None)
+            self.assertEqual(last["payer"], "Savings")
+            self.assertIsNone(db.last_deposit_details(connection, self.business, treatment="Transfer",
+                                                      exclude_transaction_id=dep))
 
 
 if __name__ == "__main__":

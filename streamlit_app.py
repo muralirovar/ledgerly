@@ -217,7 +217,7 @@ nav = {
     "▣  Tax prep": "Tax Prep",
     "⇧  Import transactions": "Import / Paste",
     "▤  Statements & checks": "Statements & Checks",
-    "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
+    "＄  Deposits": "Deposits", "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
     "⌂  Vendors": "Vendors", "⌁  Categories & rules": "Categories & Rules",
     "◇  Accounts & credit": "Accounts & Credit",
     "⚙  Manage business": "Manage Business", "↓  Export & settings": "Export & Settings",
@@ -1191,6 +1191,118 @@ elif page == "Statements & Checks":
             confirm_delete_dialog(register[selected_rows[0]])
     else:
         st.caption("No checks have been confirmed yet.")
+
+
+elif page == "Deposits":
+    page_header("Account for every deposit",
+                "Cash, ATM, mobile and wire credits in one place. Tick the ones that belong together and classify them in one step.",
+                "Deposits")
+    with db.connect(DB_PATH) as connection:
+        accounts = db.list_accounts(connection, business_id)
+        categories = db.list_categories(connection, business_id)
+    f1, f2, f3, f4 = st.columns([1.2, 1, 1, 1])
+    acct_options = {"All accounts": None, **{a["name"]: int(a["id"]) for a in accounts}}
+    acct_pick = f1.selectbox("Account", list(acct_options), key="dep_account")
+    kind_pick = f2.selectbox("Deposit type", ["All", "Cash / ATM", "Mobile / check", "Wire / ACH", "Other deposit", "Other credit"], key="dep_kind")
+    state_pick = f3.selectbox("Show", ["Needs classifying", "Already classified", "Everything"], key="dep_state")
+    year_pick = f4.selectbox("Year", ["All"] + sorted({str(d)[:4] for d in [date.today().year, date.today().year - 1]}, reverse=True), key="dep_year")
+    start = end = None
+    if year_pick != "All":
+        start, end = f"{year_pick}-01-01", f"{year_pick}-12-31"
+    with db.connect(DB_PATH) as connection:
+        deposits = db.list_deposits(connection, business_id, account_id=acct_options[acct_pick], start=start, end=end)
+    if kind_pick != "All":
+        deposits = [d for d in deposits if d["kind"] == kind_pick]
+    if state_pick == "Needs classifying":
+        deposits = [d for d in deposits if d["status"] == "needs_review"]
+    elif state_pick == "Already classified":
+        deposits = [d for d in deposits if d["status"] != "needs_review"]
+
+    total = sum(float(d["signed_amount"]) for d in deposits)
+    m1, m2 = st.columns(2)
+    m1.metric("Deposits shown", f"{len(deposits):,}")
+    m2.metric("Total", money(total))
+    if not deposits:
+        st.success("No deposits match these filters.")
+        st.stop()
+
+    frame = pd.DataFrame([{
+        "Select": False, "ID": d["id"], "Date": d["transaction_date"], "Account": d["account"],
+        "Type": d["kind"], "Description": d["description"], "Amount": float(d["signed_amount"]),
+        "Accounted as": d["treatment"] if d["status"] != "needs_review" else "— not yet —",
+        "From / source": d["counterparty"] or "", "Note": d["notes"] or "",
+        "Check images": "✓" if d["linked_checks"] else "",
+    } for d in deposits])
+    pick_all = st.checkbox("Select all shown", key="dep_select_all")
+    if pick_all:
+        frame["Select"] = True
+    edited = st.data_editor(
+        frame, hide_index=True, width="stretch", height=420,
+        key=f"dep_editor_{pick_all}_{acct_pick}_{kind_pick}_{state_pick}_{year_pick}",
+        disabled=[c for c in frame.columns if c != "Select"],
+        column_config={"ID": None, "Amount": st.column_config.NumberColumn(format="$%.2f"),
+                       "Select": st.column_config.CheckboxColumn("✓", width="small")})
+    chosen = edited[edited["Select"]]
+    chosen_ids = [int(i) for i in chosen["ID"]]
+    chosen_total = float(chosen["Amount"].sum()) if len(chosen) else 0.0
+    st.markdown(f"**{len(chosen_ids)} selected · {money(chosen_total)}**")
+
+    with st.container(border=True):
+        st.markdown("**Classify the selected deposits**")
+        explain = {
+            "Revenue": "Sales or income. Counts in revenue and the P&L.",
+            "Loan draw": "Money you borrowed. Not income. Enter who lent it.",
+            "Transfer": "Moved between your own accounts. Not income.",
+            "Owner contribution": "Money you put into the business. Not income, not a loan.",
+            "Receivable repayment": "Someone repaying a loan you made. Not income. Enter who repaid.",
+            "Revenue refund": "A customer refund reversal. Reduces revenue.",
+            "Expense refund": "A vendor refunded you. Reduces expenses.",
+            "Excluded": "Leave out of the books entirely.",
+        }
+        c1, c2 = st.columns(2)
+        treatment = c1.selectbox("Treatment", list(db.DEPOSIT_TREATMENTS), key="dep_treatment")
+        c1.caption(explain[treatment])
+        labels = {"Revenue": "Received from / customer", "Loan draw": "Loan received from",
+                  "Transfer": "Transferred from", "Owner contribution": "Contributed by",
+                  "Receivable repayment": "Repaid by", "Revenue refund": "Refund paid to",
+                  "Expense refund": "Refund received from", "Excluded": "Source (optional)"}
+        counterparty = c2.text_input(labels[treatment], key=f"dep_party_{treatment}")
+        category_id = None
+        related_id = None
+        if treatment == "Revenue":
+            revenue_cats = [c for c in categories if c["default_treatment"] in ("Revenue", "Revenue refund")] or categories
+            cat_by_name = {c["name"]: int(c["id"]) for c in revenue_cats}
+            cat_pick = c1.selectbox("Revenue category", ["— No category —"] + list(cat_by_name), key="dep_category")
+            category_id = cat_by_name.get(cat_pick)
+        if treatment == "Transfer":
+            rel = {"— None —": None, **{a["name"]: int(a["id"]) for a in accounts}}
+            related_id = rel[c2.selectbox("From account", list(rel), key="dep_related")]
+        note = st.text_input("Note (optional)", key="dep_note", placeholder="e.g. cash sales week of Apr 14")
+        if st.button(f"Classify {len(chosen_ids)} deposit(s) as {treatment}", type="primary",
+                     disabled=not chosen_ids, width="stretch"):
+            if treatment in ("Loan draw", "Receivable repayment") and not counterparty.strip():
+                st.error("Enter who the loan is with so the balance can be tracked.")
+            else:
+                with db.connect(DB_PATH) as connection:
+                    done = db.classify_deposits(
+                        connection, business_id=business_id, transaction_ids=chosen_ids,
+                        treatment=treatment, counterparty=counterparty, category_id=category_id,
+                        related_account_id=related_id, notes=note)
+                st.session_state["dep_message"] = f"Classified {done} deposit(s) as {treatment}."
+                rerun()
+    if st.session_state.get("dep_message"):
+        st.success(st.session_state.pop("dep_message"))
+
+    with db.connect(DB_PATH) as connection:
+        every = db.list_deposits(connection, business_id, start=start, end=end)
+    summary: dict[str, list[float]] = {}
+    for d in every:
+        key = d["treatment"] if d["status"] != "needs_review" else "Not yet classified"
+        item = summary.setdefault(key, [0, 0.0]); item[0] += 1; item[1] += float(d["signed_amount"])
+    st.markdown("**Where all deposits stand**")
+    st.dataframe(pd.DataFrame([{"Accounted as": k, "Deposits": v[0], "Total": v[1]} for k, v in sorted(summary.items())]),
+                 hide_index=True, width="stretch",
+                 column_config={"Total": st.column_config.NumberColumn(format="$%.2f")})
 
 
 elif page == "Review Queue":

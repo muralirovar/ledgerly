@@ -482,6 +482,38 @@ class BooksTests(unittest.TestCase):
             ("01/14/26", "255", 4000.0),
         ])
 
+    def test_bulk_deposit_classification(self):
+        with db.connect(self.path) as connection:
+            ids = []
+            for day, desc, amount in [("2026-04-21", "BKOFAMERICA ATM 04/21 DEPOSIT NORMANDY", 9576),
+                                      ("2026-05-06", "BKOFAMERICA MOBILE 05/06 DEPOSIT *MOBILE MD", 10218),
+                                      ("2026-06-01", "WIRE FROM ACME", 500)]:
+                new, _, _ = db.insert_transaction(
+                    connection, business_id=self.business, account_id=self.account,
+                    transaction_date=day, posting_date=None, description=desc,
+                    source_amount=amount, signed_amount=amount)
+                ids.append(new)
+            outgoing, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-06-02", posting_date=None, description="PAYMENT",
+                source_amount=-50, signed_amount=-50)
+            kinds = {d["id"]: d["kind"] for d in db.list_deposits(connection, self.business)}
+            self.assertEqual(kinds[ids[0]], "Cash / ATM")
+            self.assertEqual(kinds[ids[1]], "Mobile / check")
+            self.assertEqual(kinds[ids[2]], "Wire / ACH")
+            self.assertNotIn(outgoing, kinds)
+            done = db.classify_deposits(connection, business_id=self.business,
+                                        transaction_ids=[ids[0], ids[1], outgoing],
+                                        treatment="Owner contribution", counterparty="Murali")
+            self.assertEqual(done, 2)  # the debit is never touched
+            rows = {r["id"]: r for r in db.list_transactions(connection, self.business)}
+            self.assertEqual(rows[ids[0]]["treatment"], "Owner contribution")
+            self.assertEqual(rows[ids[0]]["counterparty"], "Murali")
+            self.assertEqual(rows[outgoing]["status"], "needs_review")
+            with self.assertRaises(ValueError):
+                db.classify_deposits(connection, business_id=self.business, transaction_ids=ids,
+                                     treatment="Expense")
+
 
 if __name__ == "__main__":
     unittest.main()

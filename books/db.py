@@ -20,6 +20,7 @@ TREATMENTS = (
     "Principal repayment",
     "Loan receivable",
     "Receivable repayment",
+    "Owner contribution",
     "Excluded",
     "Needs review",
 )
@@ -1497,6 +1498,79 @@ _NOT_A_CHECK = re.compile(r"\bACH\b|WIRE|ZELLE|\bCTX\b|\bPPD\b|\bCCD\b|DES:|INTE
 def looks_like_check_deposit(description: str) -> bool:
     text = description or ""
     return bool(_CHECK_DEPOSIT_HINT.search(text)) and not _NOT_A_CHECK.search(text)
+
+
+_DEPOSIT_KINDS = (
+    ("Cash / ATM", re.compile(r"\bATM\b|\bCASH\b|BRANCH\s+DEP|COUNTER\s+DEP", re.I)),
+    ("Mobile / check", re.compile(r"MOBILE|REMOTE|CHECK\s+DEP|CHK\s+DEP|\bCHECK\b", re.I)),
+    ("Wire / ACH", re.compile(r"\bWIRE\b|\bACH\b|ZELLE|TRANSFER|XFER|\bDEPOSIT\s+FROM\b", re.I)),
+    ("Other deposit", re.compile(r"DEPOSIT", re.I)),
+)
+
+
+def deposit_kind(description: str) -> str:
+    """How a credit reached the account, judged from its bank description."""
+    for kind, pattern in _DEPOSIT_KINDS:
+        if pattern.search(description or ""):
+            return kind
+    return "Other credit"
+
+
+def list_deposits(
+    connection: sqlite3.Connection, business_id: int, *, account_id: int | None = None,
+    start: str | None = None, end: str | None = None,
+) -> list[dict[str, Any]]:
+    """Every credit (money in) with how it arrived and how it is currently accounted for."""
+    clauses = ["t.business_id = ?", "t.signed_amount > 0"]
+    params: list[Any] = [business_id]
+    if account_id:
+        clauses.append("t.account_id = ?"); params.append(account_id)
+    if start:
+        clauses.append("t.transaction_date >= ?"); params.append(start)
+    if end:
+        clauses.append("t.transaction_date <= ?"); params.append(end)
+    rows = [dict(row) for row in connection.execute(
+        f"""SELECT t.id, t.transaction_date, a.name AS account, t.description, t.signed_amount,
+                   t.treatment, t.status, t.counterparty, t.notes, c.name AS category,
+                   (SELECT COUNT(*) FROM check_register r WHERE r.transaction_id = t.id) AS linked_checks
+            FROM transactions t JOIN accounts a ON a.id = t.account_id
+            LEFT JOIN categories c ON c.id = t.category_id
+            WHERE {' AND '.join(clauses)} ORDER BY t.transaction_date DESC, t.id DESC""", params)]
+    for row in rows:
+        row["kind"] = deposit_kind(row["description"])
+    return rows
+
+
+DEPOSIT_TREATMENTS = (
+    "Revenue", "Loan draw", "Transfer", "Owner contribution", "Receivable repayment",
+    "Revenue refund", "Expense refund", "Excluded",
+)
+
+
+def classify_deposits(
+    connection: sqlite3.Connection, *, business_id: int, transaction_ids: list[int],
+    treatment: str, counterparty: str = "", category_id: int | None = None,
+    related_account_id: int | None = None, notes: str | None = None,
+) -> int:
+    """Account for several deposits at once. Only credits of this business are touched."""
+    if treatment not in DEPOSIT_TREATMENTS:
+        raise ValueError(f"{treatment} is not a valid treatment for a deposit.")
+    done = 0
+    for transaction_id in transaction_ids:
+        row = connection.execute(
+            "SELECT id FROM transactions WHERE id = ? AND business_id = ? AND signed_amount > 0",
+            (int(transaction_id), business_id)).fetchone()
+        if not row:
+            continue
+        update_transaction_classification(
+            connection, int(transaction_id), category_id=category_id, treatment=treatment,
+            related_account_id=related_account_id, notes=notes or None)
+        if counterparty.strip():
+            set_transaction_counterparty(
+                connection, business_id=business_id, transaction_id=int(transaction_id),
+                counterparty=counterparty)
+        done += 1
+    return done
 
 
 def list_unreconciled_deposits(

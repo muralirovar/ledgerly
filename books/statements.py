@@ -173,6 +173,53 @@ def extract_check_images(pdf_bytes: bytes) -> list[bytes]:
     return [data for _, data in sorted(images, key=lambda pair: pair[0], reverse=True)]
 
 
+def extract_check_images_with_text(pdf_bytes: bytes) -> list[tuple[bytes, str]]:
+    """Every check-sized image in a PDF, in page order, with the text printed on its page."""
+    found: list[tuple[bytes, str]] = []
+    reader = PdfReader(BytesIO(pdf_bytes))
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        for item in page.images:
+            image = item.image
+            width, height = image.size
+            if width < 400 or height < 150:
+                continue
+            found.append((_image_png(image), text))
+    return found
+
+
+def group_check_images(
+    images: list[tuple[bytes, str]], per_check: int = 2
+) -> list[list[tuple[bytes, str]]]:
+    """Split a flat list of images into checks (front/back pairs by default)."""
+    per_check = max(1, per_check)
+    return [images[i:i + per_check] for i in range(0, len(images), per_check)]
+
+
+def match_text_to_check(checks: list[dict[str, Any]], text: str) -> int | None:
+    """Find the statement check whose check number or amount is printed in ``text``."""
+    for number in re.findall(r"Check\s*(?:number|no\.?|#)\s*:?\s*(\d+)", text, flags=re.IGNORECASE):
+        hits = [i for i, check in enumerate(checks) if str(check["check_number"]) == number]
+        if len(hits) == 1:
+            return hits[0]
+    for raw in dict.fromkeys(re.findall(r"\$?\s*([\d,]+\.\d{2})", text)):
+        try:
+            value = _money(raw)
+        except ValueError:
+            continue
+        hits = [i for i, check in enumerate(checks) if abs(float(check["amount"]) - value) < 0.005]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def resolve_check_index(checks: list[dict[str, Any]], image_set: dict[str, Any]) -> int | None:
+    """The statement check an image set belongs to: an explicit guess if it has one, else the file name."""
+    if "check_index" in image_set:
+        return image_set["check_index"]
+    return match_check_index(checks, image_set["name"])
+
+
 def extract_boa_check_image_sets(pdf_bytes: bytes, source_name: str) -> list[dict[str, Any]]:
     """Pair embedded BOA check images with the printed check metadata on each image page."""
     result: list[dict[str, Any]] = []

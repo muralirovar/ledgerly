@@ -364,6 +364,22 @@ class BooksTests(unittest.TestCase):
                 connection, business_id=self.business, check_id=ids[1], reset_transaction=True))
             self.assertEqual(db.get_transaction(connection, deposit)["status"], "needs_review")
 
+    def test_multi_check_pdf_grouping_and_text_match(self):
+        from books import statements
+        checks = [{"check_number": "147", "amount": 11000.0}, {"check_number": "148", "amount": 250.0},
+                  {"check_number": "149", "amount": 975.5}]
+        images = [(b"a", "p1"), (b"b", "p1"), (b"c", "p2"), (b"d", "p2"), (b"e", "p3")]
+        groups = statements.group_check_images(images, 2)
+        self.assertEqual([[i[0] for i in g] for g in groups], [[b"a", b"b"], [b"c", b"d"], [b"e"]])
+        self.assertEqual(statements.group_check_images(images, 1)[4][0][0], b"e")
+        self.assertEqual(statements.match_text_to_check(checks, "Pay to Acme $975.50 Dollars"), 2)
+        self.assertEqual(statements.match_text_to_check(checks, "Check number: 148"), 1)
+        self.assertIsNone(statements.match_text_to_check(checks, "nothing useful 12.34"))
+        explicit = {"name": "scan.pdf · check 2", "check_index": 1}
+        self.assertEqual(statements.resolve_check_index(checks, explicit), 1)
+        self.assertIsNone(statements.resolve_check_index(checks, {"name": "x.pdf", "check_index": None}))
+        self.assertEqual(statements.resolve_check_index(checks, {"name": "11000.pdf"}), 0)
+
     def test_loan_receivable_balance(self):
         self.assertIn("Loan receivable", db.TREATMENTS)
         with db.connect(self.path) as connection:

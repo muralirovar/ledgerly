@@ -805,13 +805,27 @@ elif page == "Statements & Checks":
                 "Check PDFs listed below", type=["pdf"], accept_multiple_files=True,
                 key=f"truist_check_pdfs_{workspace['account_id']}_{parsed['statement_date']}")
             for uploaded in check_files or []:
-                extracted = statements.extract_check_images(uploaded.getvalue())
-                if extracted:
-                    image_sets.append({"name": uploaded.name, "images": extracted})
+                flat = statements.extract_check_images_with_text(uploaded.getvalue())
+                if len(flat) <= 2:
+                    # one check: show the largest image first, as before
+                    extracted = statements.extract_check_images(uploaded.getvalue())
+                    if extracted:
+                        image_sets.append({"name": uploaded.name, "images": extracted})
+                    continue
+                st.info(f"“{uploaded.name}” contains {len(flat)} check images — more than one check. "
+                        "It has been split so each check can be confirmed on its own.")
+                per_check = st.radio(
+                    f"Images per check in {uploaded.name}", [2, 1], horizontal=True,
+                    index=0 if len(flat) % 2 == 0 else 1, key=f"images_per_check_{uploaded.name}",
+                    format_func=lambda n: "2 (front and back)" if n == 2 else "1 (front only)")
+                for position, group in enumerate(statements.group_check_images(flat, per_check), start=1):
+                    guess = statements.match_text_to_check(checks, " ".join(text for _, text in group))
+                    image_sets.append({"name": f"{uploaded.name} · check {position}",
+                                       "images": [png for png, _ in group], "check_index": guess})
 
             uploaded_indexes = {
                 matched for item in image_sets
-                if (matched := statements.match_check_index(checks, item["name"])) is not None
+                if (matched := statements.resolve_check_index(checks, item)) is not None
             }
             amount_counts: dict[float, int] = {}
             for item in checks:
@@ -836,7 +850,7 @@ elif page == "Statements & Checks":
                          column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
 
         stray_files = [item["name"] for item in image_sets
-                       if checks and statements.match_check_index(checks, item["name"]) is None]
+                       if checks and statements.resolve_check_index(checks, item) is None]
         if stray_files:
             st.warning("These uploaded files don't match any check on the statement by amount or check number, "
                        "so you'll have to pick the check yourself: " + ", ".join(stray_files))
@@ -851,7 +865,8 @@ elif page == "Statements & Checks":
             names = list(image_by_name)
             pending_names = [
                 name for name in names
-                if (idx := statements.match_check_index(checks, name)) is not None and not mapped_check(checks[idx])]
+                if (idx := statements.resolve_check_index(checks, image_by_name[name])) is not None
+                and not mapped_check(checks[idx])]
             if pending_names:
                 following = [n for n in pending_names if names.index(n) > names.index(active_image_name)]
                 target = (following or pending_names)[0]
@@ -859,8 +874,9 @@ elif page == "Statements & Checks":
                     st.button(f"Next unmapped check →  {target}", on_click=go_to_check_image, args=(target,))
             elif checks:
                 st.caption("No uploaded check image points at an unmapped check.")
-            suggested_index = statements.suggest_check_index(checks, active_image_name) if checks else 0
-            guessed = bool(checks) and statements.match_check_index(checks, active_image_name) is None
+            resolved_index = statements.resolve_check_index(checks, active_image) if checks else None
+            suggested_index = resolved_index or 0
+            guessed = bool(checks) and resolved_index is None
             check_labels = [
                 f"#{item['check_number']} · {item['cleared_date']} · {money(float(item['amount']))}"
                 f" · {'✓ Mapped' if mapped_check(item) else 'Unmapped'}"

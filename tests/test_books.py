@@ -554,5 +554,33 @@ class BooksTests(unittest.TestCase):
                                                       exclude_transaction_id=dep))
 
 
+    def test_parties_list_rename_and_merge(self):
+        with db.connect(self.path) as connection:
+            ids = []
+            for day, amount, treatment, party in [
+                    ("2026-03-01", -4000, "Loan receivable", "Colina Tech Solutions"),
+                    ("2026-04-01", 1000, "Receivable repayment", "Colina Tech Solutions LLC"),
+                    ("2026-05-01", 5000, "Loan draw", "Bank Lender")]:
+                new, _, _ = db.insert_transaction(
+                    connection, business_id=self.business, account_id=self.account, transaction_date=day,
+                    posting_date=None, description=f"TXN {day}", source_amount=amount, signed_amount=amount)
+                db.update_transaction_classification(connection, new, category_id=None, treatment=treatment)
+                connection.execute("UPDATE transactions SET counterparty = ? WHERE id = ?", (party, new))
+                ids.append(new)
+            parties = {p["party"]: p for p in db.list_parties(connection, self.business)}
+            colina = parties["Colina Tech Solutions LLC"]
+            self.assertEqual((colina["owed_to_us"], len(colina["spellings"]), colina["transactions"]), (3000.0, 2, 2))
+            self.assertEqual(parties["Bank Lender"]["we_owe"], 5000.0)
+            counts = db.rename_party(connection, business_id=self.business,
+                                     old_names=colina["spellings"], new_name="  Colina   Tech Solutions LLC ")
+            self.assertEqual(counts["transactions"], 2)
+            merged = [p for p in db.list_parties(connection, self.business) if "Colina" in p["party"]]
+            self.assertEqual(len(merged), 1)
+            self.assertEqual(merged[0]["spellings"], ["Colina Tech Solutions LLC"])
+            self.assertEqual(len(db.party_activity(connection, self.business, ["Colina Tech Solutions LLC"])["transactions"]), 2)
+            with self.assertRaises(ValueError):
+                db.rename_party(connection, business_id=self.business, old_names=["Bank Lender"], new_name=" ")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -218,7 +218,7 @@ nav = {
     "⇧  Import transactions": "Import / Paste",
     "▤  Statements & checks": "Statements & Checks",
     "＄  Deposits": "Deposits", "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
-    "⌂  Vendors": "Vendors", "⌁  Categories & rules": "Categories & Rules",
+    "☷  Parties": "Parties", "⌂  Vendors": "Vendors", "⌁  Categories & rules": "Categories & Rules",
     "◇  Accounts & credit": "Accounts & Credit",
     "⚙  Manage business": "Manage Business", "↓  Export & settings": "Export & Settings",
     "🛡  Admin & backup": "Admin & Backup",
@@ -1039,14 +1039,26 @@ elif page == "Statements & Checks":
     if not credits:
         st.success("No unreconciled deposits for this account" + ("." if month_choice == "All months" else f" in {month_choice}."))
     else:
-        st.dataframe(pd.DataFrame(credits).rename(columns={
-            "id": "Transaction #", "transaction_date": "Date", "description": "Description",
-            "signed_amount": "Amount", "treatment": "Treatment", "status": "Status"}),
-            hide_index=True, width="stretch",
-            column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
         credit_by_label = {
             f"#{row['id']} · {row['transaction_date']} · {money(float(row['signed_amount']))} · {row['description'][:70]}": row
             for row in credits}
+        credit_labels = list(credit_by_label)
+        st.caption("Click a row to select that deposit below.")
+        credit_grid_key = f"deposit_grid_{selected_account_name}_{month_choice}_{show_all_credits}"
+        credit_grid = st.dataframe(pd.DataFrame(credits).rename(columns={
+            "id": "Transaction #", "transaction_date": "Date", "description": "Description",
+            "signed_amount": "Amount", "treatment": "Treatment", "status": "Status"}),
+            hide_index=True, width="stretch", key=credit_grid_key,
+            on_select="rerun", selection_mode="single-row",
+            column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+        clicked = credit_grid.selection.rows
+        if clicked and clicked[0] < len(credit_labels):
+            clicked_label = credit_labels[clicked[0]]
+            if st.session_state.get("deposit_grid_applied") != (credit_grid_key, clicked_label):
+                st.session_state["deposit_grid_applied"] = (credit_grid_key, clicked_label)
+                st.session_state["deposit_choice"] = clicked_label
+        if st.session_state.get("deposit_choice") not in credit_by_label:
+            st.session_state.pop("deposit_choice", None)
         deposit_label = st.selectbox("Deposit to reconcile", list(credit_by_label), key="deposit_choice")
         deposit = credit_by_label[deposit_label]
         deposit_id = int(deposit["id"])
@@ -1682,6 +1694,88 @@ elif page == "Transactions":
                     db.get_or_create_category(connection, business_id, new_category_name.strip(), new_category_treatment)
                 st.success(f"Added {new_category_name.strip()}.")
                 rerun()
+
+
+elif page == "Parties":
+    page_header("Everyone you do business with",
+                "Lenders, borrowers, customers and payees in one list. Rename a party everywhere or merge duplicate spellings.",
+                "Parties")
+    with db.connect(DB_PATH) as connection:
+        parties = db.list_parties(connection, business_id)
+    if not parties:
+        st.info("No parties yet. Names appear here once you add a counterparty to a transaction or confirm a check.")
+        st.stop()
+    p1, p2, p3 = st.columns([2, 1.2, 1])
+    party_search = p1.text_input("Search parties", key="party_search", placeholder="Name…")
+    party_kind = p2.selectbox("Show", ["All parties", "Owe us money", "We owe them", "Several spellings"], key="party_kind")
+    needle = party_search.strip().lower()
+    shown = [p for p in parties
+             if (not needle or needle in " ".join(p["spellings"]).lower())
+             and (party_kind == "All parties"
+                  or (party_kind == "Owe us money" and abs(p["owed_to_us"]) > 0.004)
+                  or (party_kind == "We owe them" and abs(p["we_owe"]) > 0.004)
+                  or (party_kind == "Several spellings" and len(p["spellings"]) > 1))]
+    p3.metric("Parties", f"{len(shown):,} of {len(parties):,}")
+    if not shown:
+        st.info("No parties match these filters.")
+        st.stop()
+    party_frame = pd.DataFrame([{
+        "Party": p["party"], "Spellings on record": " · ".join(p["spellings"]) if len(p["spellings"]) > 1 else "",
+        "Transactions": p["transactions"], "Checks": p["checks"], "Money in": p["money_in"],
+        "Money out": p["money_out"], "Owes us": p["owed_to_us"], "We owe": p["we_owe"],
+        "Last activity": p["last_activity"]} for p in shown])
+    st.caption("Select one or more rows, then rename or merge below.")
+    money_cols = {c: st.column_config.NumberColumn(format="$%.2f") for c in ("Money in", "Money out", "Owes us", "We owe")}
+    party_grid = st.dataframe(party_frame, hide_index=True, width="stretch", key=f"party_grid_{needle}_{party_kind}",
+                              on_select="rerun", selection_mode="multi-row", column_config=money_cols)
+    picked = [shown[i] for i in party_grid.selection.rows]
+    if picked:
+        names = [n for p in picked for n in p["spellings"]]
+        with st.container(border=True):
+            st.markdown(f"**{len(picked)} selected** · " + ", ".join(p["party"] for p in picked[:4]) + ("…" if len(picked) > 4 else ""))
+            default_name = max(names, key=len)
+            new_name = st.text_input(
+                "Rename to" if len(picked) == 1 and len(names) == 1 else "Rename / merge into",
+                value=default_name, key=f"party_new_{'|'.join(sorted(names))}",
+                help="Every selected spelling is changed to this name on transactions and checks.")
+
+            @st.dialog("Rename or merge parties?")
+            def confirm_party_dialog(old_names: list[str], target: str) -> None:
+                st.write(f"Change **{len(old_names)}** spelling(s) to **{target}**:")
+                st.caption(" · ".join(old_names))
+                st.caption("Applies to bank transactions, the check register and the statement log. Amounts are never changed.")
+                yes, no = st.columns(2)
+                if yes.button("Apply", type="primary", width="stretch"):
+                    with db.connect(DB_PATH) as connection:
+                        counts = db.rename_party(connection, business_id=business_id, old_names=old_names, new_name=target)
+                    st.session_state["party_message"] = (
+                        f"Renamed to {target}: {counts['transactions']} transaction(s), {counts['checks']} check(s) updated.")
+                    rerun()
+                if no.button("Cancel", width="stretch"):
+                    st.rerun()
+
+            changes = [n for n in names if n != " ".join(new_name.split())] or names
+            if st.button("Rename / merge…", type="primary", disabled=not new_name.strip()
+                         or (len(names) == 1 and names[0] == " ".join(new_name.split()))):
+                confirm_party_dialog(changes, new_name)
+        if len(picked) == 1:
+            with db.connect(DB_PATH) as connection:
+                activity = db.party_activity(connection, business_id, names)
+            section_label(f"Activity for {picked[0]['party']}")
+            if activity["transactions"]:
+                st.markdown("**Bank transactions**")
+                st.dataframe(pd.DataFrame(activity["transactions"]).rename(columns={
+                    "id": "Transaction #", "transaction_date": "Date", "account": "Account", "description": "Description",
+                    "signed_amount": "Amount", "treatment": "Treatment"}), hide_index=True, width="stretch",
+                    column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            if activity["checks"]:
+                st.markdown("**Checks**")
+                st.dataframe(pd.DataFrame(activity["checks"]).rename(columns={
+                    "cleared_date": "Cleared", "check_number": "Check #", "check_type": "Direction", "amount": "Amount",
+                    "account": "Account", "treatment": "Treatment", "memo": "Memo"}), hide_index=True, width="stretch",
+                    column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+    if st.session_state.get("party_message"):
+        st.success(st.session_state.pop("party_message"))
 
 
 elif page == "Vendors":

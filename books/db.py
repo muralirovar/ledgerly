@@ -1313,6 +1313,113 @@ def known_parties(connection: sqlite3.Connection, business_id: int) -> list[str]
     return sorted(best.values(), key=str.lower)
 
 
+def list_parties(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
+    """Every counterparty on checks and bank transactions, with activity and loan balances.
+
+    Spellings that differ only by case, punctuation or an LLC/Inc-style suffix are one party.
+    Check-register amounts count only when the check is not already tied to a bank transaction.
+    """
+    parties: dict[str, dict[str, Any]] = {}
+
+    def entry(name: str) -> dict[str, Any]:
+        key = _payee_key(name)
+        item = parties.setdefault(key, {
+            "spellings": {}, "transactions": 0, "checks": 0, "money_in": 0.0, "money_out": 0.0,
+            "lent": 0.0, "lent_repaid": 0.0, "borrowed": 0.0, "borrowed_repaid": 0.0, "last_date": ""})
+        item["spellings"][name] = item["spellings"].get(name, 0) + 1
+        return item
+
+    for row in connection.execute(
+        """SELECT counterparty, signed_amount, treatment, transaction_date FROM transactions
+           WHERE business_id = ? AND TRIM(COALESCE(counterparty, '')) <> ''""", (business_id,)):
+        item = entry(row["counterparty"].strip())
+        amount = float(row["signed_amount"])
+        item["transactions"] += 1
+        item["money_in" if amount > 0 else "money_out"] += abs(amount)
+        item["last_date"] = max(item["last_date"], row["transaction_date"])
+        treatment = row["treatment"]
+        if treatment == "Loan receivable":
+            item["lent"] += abs(amount)
+        elif treatment == "Receivable repayment":
+            item["lent_repaid"] += abs(amount)
+        elif treatment == "Loan draw":
+            item["borrowed"] += abs(amount)
+        elif treatment == "Principal repayment":
+            item["borrowed_repaid"] += abs(amount)
+    for row in connection.execute(
+        """SELECT payee, amount, check_type, treatment, cleared_date, transaction_id FROM check_register
+           WHERE business_id = ? AND TRIM(COALESCE(payee, '')) <> ''""", (business_id,)):
+        item = entry(row["payee"].strip())
+        item["checks"] += 1
+        item["last_date"] = max(item["last_date"], row["cleared_date"] or "")
+        if row["transaction_id"] is None:
+            amount = float(row["amount"])
+            item["money_in" if row["check_type"] == "deposit" else "money_out"] += amount
+            treatment = row["treatment"]
+            if treatment == "Loan receivable":
+                item["lent"] += amount
+            elif treatment == "Receivable repayment":
+                item["lent_repaid"] += amount
+            elif treatment == "Loan draw":
+                item["borrowed"] += amount
+            elif treatment == "Principal repayment":
+                item["borrowed_repaid"] += amount
+    result = []
+    for item in parties.values():
+        spellings = sorted(item["spellings"], key=lambda n: (-len(n), n))
+        result.append({
+            "party": spellings[0], "spellings": spellings, "transactions": item["transactions"],
+            "checks": item["checks"], "money_in": round(item["money_in"], 2),
+            "money_out": round(item["money_out"], 2),
+            "owed_to_us": round(item["lent"] - item["lent_repaid"], 2),
+            "we_owe": round(item["borrowed"] - item["borrowed_repaid"], 2),
+            "last_activity": item["last_date"]})
+    return sorted(result, key=lambda r: r["party"].lower())
+
+
+def rename_party(
+    connection: sqlite3.Connection, *, business_id: int, old_names: list[str], new_name: str,
+) -> dict[str, int]:
+    """Rename or merge parties everywhere: bank transactions, check register and the statement log."""
+    new_name = " ".join((new_name or "").split())
+    if not new_name:
+        raise ValueError("Enter the name to use.")
+    olds = [n for n in dict.fromkeys(old_names) if n]
+    if not olds:
+        raise ValueError("Select at least one party.")
+    now = utc_now()
+    counts = {"transactions": 0, "checks": 0}
+    for old in olds:
+        counts["transactions"] += connection.execute(
+            "UPDATE transactions SET counterparty = ?, updated_at = ? WHERE business_id = ? AND counterparty = ?",
+            (new_name, now, business_id, old)).rowcount
+        counts["checks"] += connection.execute(
+            "UPDATE check_register SET payee = ?, updated_at = ? WHERE business_id = ? AND payee = ?",
+            (new_name, now, business_id, old)).rowcount
+        connection.execute(
+            """UPDATE statement_log_checks SET payee = ? WHERE payee = ? AND log_id IN
+               (SELECT id FROM statement_log WHERE business_id = ?)""", (new_name, old, business_id))
+    return counts
+
+
+def party_activity(
+    connection: sqlite3.Connection, business_id: int, names: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Bank transactions and checks recorded under the given spellings of a party."""
+    marks = ",".join("?" for _ in names) or "''"
+    transactions = [dict(r) for r in connection.execute(
+        f"""SELECT t.id, t.transaction_date, a.name AS account, t.description, t.signed_amount, t.treatment
+            FROM transactions t JOIN accounts a ON a.id = t.account_id
+            WHERE t.business_id = ? AND t.counterparty IN ({marks})
+            ORDER BY t.transaction_date DESC, t.id DESC""", [business_id, *names])]
+    checks = [dict(r) for r in connection.execute(
+        f"""SELECT r.cleared_date, r.check_number, r.check_type, r.amount, a.name AS account, r.treatment, r.memo
+            FROM check_register r JOIN accounts a ON a.id = r.account_id
+            WHERE r.business_id = ? AND r.payee IN ({marks})
+            ORDER BY r.cleared_date DESC, r.id DESC""", [business_id, *names])]
+    return {"transactions": transactions, "checks": checks}
+
+
 def payee_history(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
     """Distinct counterparties from the register with their most recent category/treatment/memo."""
     seen: dict[str, dict[str, Any]] = {}

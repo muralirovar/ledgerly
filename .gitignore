@@ -9,3 +9,4 @@ data/*.db
 data/*.sqlite*
 *.xlsx
 .DS_Store
+data/*.bak*

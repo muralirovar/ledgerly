@@ -1059,6 +1059,15 @@ def set_setting(connection: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _check_number_in(description: str, check_number: str) -> bool:
+    """True when the description names this check, e.g. 'Check #147' or 'CHECK 0147'."""
+    number = str(check_number).strip().lstrip("0")
+    if not number.isdigit():
+        return False
+    return bool(re.search(rf"(?<!\d)0*{re.escape(number)}(?!\d)", description or "")) and bool(
+        re.search(r"chec?k|chk|ck", description or "", flags=re.IGNORECASE))
+
+
 def find_check_transaction_candidates(
     connection: sqlite3.Connection,
     *,
@@ -1067,11 +1076,13 @@ def find_check_transaction_candidates(
     amount: float,
     cleared_date: str,
     check_type: str | None = None,
+    check_number: str | None = None,
     day_window: int = 10,
 ) -> list[dict[str, Any]]:
+    """Bank transactions that could be this check; check-number matches come first."""
     if check_type is not None and check_type not in CHECK_TYPES:
         raise ValueError(f"Unsupported check type: {check_type}")
-    return [
+    rows = [
         dict(row)
         for row in connection.execute(
             """SELECT t.id, t.transaction_date, t.description, t.signed_amount,
@@ -1089,6 +1100,20 @@ def find_check_transaction_candidates(
              check_type, check_type, check_type, cleared_date),
         )
     ]
+    for row in rows:
+        row["number_match"] = bool(check_number) and _check_number_in(row["description"], str(check_number))
+    rows.sort(key=lambda row: not row["number_match"])  # stable: keeps date-distance order
+    return rows
+
+
+def reset_transaction_review(connection: sqlite3.Connection, transaction_id: int) -> None:
+    """Return a bank transaction to the review queue (used when a check link is removed)."""
+    now = utc_now()
+    connection.execute(
+        """UPDATE transactions SET category_id = NULL, treatment = 'Needs review',
+               status = 'needs_review', reviewed_at = NULL, updated_at = ? WHERE id = ?""",
+        (now, transaction_id),
+    )
 
 
 def confirm_check(
@@ -1123,6 +1148,13 @@ def confirm_check(
         signed_amount = float(matched["signed_amount"])
         if (check_type == "deposit" and signed_amount <= 0) or (check_type == "payment" and signed_amount >= 0):
             raise ValueError("The selected transaction direction does not match the check type.")
+    previous = connection.execute(
+        """SELECT transaction_id FROM check_register WHERE business_id=? AND account_id=?
+           AND check_number=? AND cleared_date=? AND amount=?""",
+        (business_id, account_id, check_number, cleared_date, amount),
+    ).fetchone()
+    if previous and previous["transaction_id"] and previous["transaction_id"] != transaction_id:
+        reset_transaction_review(connection, int(previous["transaction_id"]))
     now = utc_now()
     cursor = connection.execute(
         """INSERT INTO check_register(
@@ -1179,13 +1211,53 @@ def list_check_register(connection: sqlite3.Connection, business_id: int) -> lis
 
 
 def delete_check_register_entry(
-    connection: sqlite3.Connection, *, business_id: int, check_id: int
+    connection: sqlite3.Connection, *, business_id: int, check_id: int,
+    reset_transaction: bool = False,
 ) -> bool:
-    cursor = connection.execute(
-        "DELETE FROM check_register WHERE id = ? AND business_id = ?",
+    row = connection.execute(
+        "SELECT transaction_id FROM check_register WHERE id = ? AND business_id = ?",
         (check_id, business_id),
-    )
-    return cursor.rowcount > 0
+    ).fetchone()
+    if row is None:
+        return False
+    connection.execute(
+        "DELETE FROM check_register WHERE id = ? AND business_id = ?", (check_id, business_id))
+    if reset_transaction and row["transaction_id"]:
+        reset_transaction_review(connection, int(row["transaction_id"]))
+    return True
+
+
+def _payee_key(name: str) -> str:
+    key = re.sub(r"[^a-z0-9 ]", " ", (name or "").lower())
+    key = re.sub(r"\b(llc|l l c|inc|incorporated|corp|corporation|co|ltd|llp)\b", " ", key)
+    return " ".join(key.split())
+
+
+def payee_history(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
+    """Distinct counterparties from the register with their most recent category/treatment/memo."""
+    seen: dict[str, dict[str, Any]] = {}
+    for row in connection.execute(
+        """SELECT r.payee, r.memo, r.treatment, r.check_type, c.name AS category, r.cleared_date
+           FROM check_register r LEFT JOIN categories c ON c.id = r.category_id
+           WHERE r.business_id = ? AND TRIM(COALESCE(r.payee, '')) <> ''
+           ORDER BY r.cleared_date DESC, r.id DESC""",
+        (business_id,),
+    ):
+        key = _payee_key(row["payee"])
+        if key and key not in seen:
+            seen[key] = {"payee": row["payee"].strip(), "memo": row["memo"] or "",
+                         "treatment": row["treatment"], "category": row["category"],
+                         "check_type": row["check_type"]}
+    return sorted(seen.values(), key=lambda item: item["payee"].lower())
+
+
+def canonical_payee(connection: sqlite3.Connection, business_id: int, payee: str) -> str:
+    """Existing spelling of a counterparty that matches ignoring case, punctuation and LLC/Inc."""
+    key = _payee_key(payee)
+    for item in payee_history(connection, business_id):
+        if _payee_key(item["payee"]) == key:
+            return item["payee"]
+    return payee.strip()
 
 
 def list_loan_receivables(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:

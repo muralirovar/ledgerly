@@ -147,6 +147,24 @@ def sync_category_treatment(category_key: str, treatment_key: str, defaults: dic
         st.session_state[treatment_key] = defaults[selected]
 
 
+def apply_payee_history(history_key: str, payee_key: str, memo_key: str, category_key: str,
+                        treatment_key: str, history: dict[str, dict]) -> None:
+    item = history.get(st.session_state.get(history_key))
+    if not item:
+        return
+    st.session_state[payee_key] = item["payee"]
+    if item.get("memo"):
+        st.session_state[memo_key] = item["memo"]
+    if item.get("category") and item["category"] in st.session_state.get("_check_category_names", ()):
+        st.session_state[category_key] = item["category"]
+    if item.get("treatment") and item["treatment"] != "Needs review":
+        st.session_state[treatment_key] = item["treatment"]
+
+
+def go_to_check_image(name: str) -> None:
+    st.session_state["active_check_image"] = name
+
+
 def sync_check_direction(check_type_key: str, category_key: str, treatment_key: str) -> None:
     if st.session_state.get(category_key) == "Uncategorized":
         st.session_state[treatment_key] = (
@@ -577,6 +595,29 @@ elif page == "Statements & Checks":
             check_frame["Status"] = ["Mapped" if mapped_check(item) else "Unmapped" for item in checks]
             st.dataframe(check_frame, hide_index=True, width="stretch",
                          column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+        mapped_items = [item for item in checks if mapped_check(item)]
+        unmapped_items = [item for item in checks if not mapped_check(item)]
+        mapped_total = sum(float(item["amount"]) for item in mapped_items)
+        listed_total = sum(float(item["amount"]) for item in checks)
+        section_label("Reconciliation progress")
+        st.progress(len(mapped_items) / len(checks) if checks else 0.0,
+                    text=f"{len(mapped_items)} of {len(checks)} statement checks mapped")
+        p1, p2, p3 = st.columns(3)
+        with p1: metric_card("Mapped", money(mapped_total), f"{len(mapped_items)} checks in register", "✓", "teal")
+        with p2: metric_card("Still to map", money(listed_total - mapped_total), f"{len(unmapped_items)} checks", "◷", "gold")
+        with p3: metric_card("Control total", money(float(parsed["check_total"])),
+                             "Statement total", "$", "navy")
+        if checks and abs(listed_total - float(parsed["check_total"])) >= 0.005:
+            st.warning(f"The parsed checks add up to {money(listed_total)} but the statement says "
+                       f"{money(float(parsed['check_total']))}. A check may not have been read — compare before relying on this list.")
+        elif checks and not unmapped_items:
+            st.success("Every check on this statement is in the register and the totals agree.")
+        if unmapped_items:
+            with st.expander(f"Checks still to map ({len(unmapped_items)})"):
+                st.dataframe(pd.DataFrame(unmapped_items).rename(columns={
+                    "cleared_date": "Cleared date", "check_number": "Check #", "amount": "Amount"}),
+                    hide_index=True, width="stretch",
+                    column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
         selected_account = account_by_name[selected_account_name]
         if selected_account.get("last4") and parsed["account_last4"] and str(selected_account["last4"])[-4:] != parsed["account_last4"]:
             st.warning("The statement account ending does not match the selected account. Choose the correct account before confirming anything.")
@@ -626,6 +667,17 @@ elif page == "Statements & Checks":
             st.caption("Choose a check, then confirm its details in the panel beside the image.")
             active_image_name = st.selectbox("Check to review", list(image_by_name), key="active_check_image")
             active_image = image_by_name[active_image_name]
+            names = list(image_by_name)
+            pending_names = [
+                name for name in names
+                if (idx := statements.match_check_index(checks, name)) is not None and not mapped_check(checks[idx])]
+            if pending_names:
+                following = [n for n in pending_names if names.index(n) > names.index(active_image_name)]
+                target = (following or pending_names)[0]
+                if target != active_image_name:
+                    st.button(f"Next unmapped check →  {target}", on_click=go_to_check_image, args=(target,))
+            elif checks:
+                st.caption("No uploaded check image points at an unmapped check.")
             suggested_index = statements.suggest_check_index(checks, active_image_name) if checks else 0
             check_labels = [
                 f"#{item['check_number']} · {item['cleared_date']} · {money(float(item['amount']))}"
@@ -664,8 +716,9 @@ elif page == "Statements & Checks":
                         candidates = db.find_check_transaction_candidates(
                             connection, business_id=business_id, account_id=int(workspace["account_id"]),
                             amount=float(chosen["amount"]), cleared_date=chosen["cleared_date"],
-                            check_type=check_type)
+                            check_type=check_type, check_number=str(chosen["check_number"]))
                     candidate_labels = ["No transaction match — register only"] + [
+                        f"{'★ check # match · ' if item.get('number_match') else ''}"
                         f"#{item['id']} · {item['transaction_date']} · {money(float(item['signed_amount']))} · {item['description'][:80]}"
                         for item in candidates]
                     category_options = ["Uncategorized"] + list(category_by_name)
@@ -705,15 +758,36 @@ elif page == "Statements & Checks":
                         "Expense refund": "Refund received from",
                         "Transfer": "Transferred to / from",
                     }.get(treatment, "Counterparty — paid to or received from")
+                    payee_key = f"check_payee_{active_image_name}_{chosen['check_number']}"
+                    memo_key = f"check_memo_{active_image_name}_{chosen['check_number']}"
+                    history_key = f"check_history_{active_image_name}_{chosen['check_number']}"
+                    with db.connect(DB_PATH) as connection:
+                        history_items = db.payee_history(connection, business_id)
+                    history_map = {f"{item['payee']} · last {item['treatment'] or '—'}": item for item in history_items}
+                    st.session_state["_check_category_names"] = tuple(category_by_name)
+                    if payee_key not in st.session_state:
+                        st.session_state[payee_key] = str(existing.get("payee") or "") if existing else ""
+                    if memo_key not in st.session_state:
+                        st.session_state[memo_key] = str(existing.get("memo") or "") if existing else ""
+                    if history_map:
+                        st.selectbox(
+                            "Use a counterparty you've entered before", [""] + list(history_map), key=history_key,
+                            format_func=lambda value: value or "— type a new one below —",
+                            on_change=apply_payee_history,
+                            args=(history_key, payee_key, memo_key, category_key, treatment_key, history_map),
+                            help="Fills in the name, memo, category and treatment from the last check to this counterparty.")
                     with st.form(f"confirm_check_{active_image_name}_{chosen['check_number']}"):
                         candidate_index = next(
                             (index + 1 for index, item in enumerate(candidates)
                              if existing and int(item["id"]) == int(existing.get("transaction_id") or 0)), 0)
+                        if not existing or not existing.get("transaction_id"):
+                            candidate_index = next(
+                                (index + 1 for index, item in enumerate(candidates) if item.get("number_match")),
+                                candidate_index)
                         transaction_label = st.selectbox("Existing transaction match", candidate_labels, index=candidate_index)
-                        payee = st.text_input(counterparty_label, value=str(existing.get("payee") or "") if existing else "",
+                        payee = st.text_input(counterparty_label, key=payee_key,
                                               placeholder="Read from the check image")
-                        memo = st.text_input("Memo / purpose", value=str(existing.get("memo") or "") if existing else "",
-                                             placeholder="Optional")
+                        memo = st.text_input("Memo / purpose", key=memo_key, placeholder="Optional")
                         saved_written_date = (existing.get("written_date") if existing else None) or chosen["cleared_date"]
                         written_date = st.date_input("Date written", value=pd.to_datetime(saved_written_date).date())
                         confirmed = st.form_submit_button(
@@ -725,6 +799,10 @@ elif page == "Statements & Checks":
                             category_id = (int(category_by_name[category_name]["id"])
                                            if category_name in category_by_name else None)
                             with db.connect(DB_PATH) as connection:
+                                spelled = db.canonical_payee(connection, business_id, payee)
+                                if spelled and spelled != payee.strip():
+                                    st.info(f"Saved as “{spelled}”, matching an existing counterparty.")
+                                    payee = spelled
                                 db.confirm_check(
                                     connection, business_id=business_id, account_id=int(workspace["account_id"]),
                                     transaction_id=transaction_id, bank_name=parsed["bank"],
@@ -756,12 +834,21 @@ elif page == "Statements & Checks":
             st.write(
                 f"Remove **check #{selected_check['check_number']}** · {selected_check['cleared_date']} · "
                 f"{money(float(selected_check['amount']))} · {selected_check.get('payee') or 'No counterparty'}?")
-            st.caption("This removes only the register entry. The matched bank transaction is not deleted or recategorized.")
+            linked = selected_check.get("transaction_id")
+            reset_linked = False
+            if linked:
+                reset_linked = st.checkbox(
+                    f"Also send bank transaction #{linked} back to the Review Queue", value=True,
+                    help="Clears its category and treatment. The transaction itself is never deleted.")
+            else:
+                st.caption("This check has no linked bank transaction.")
+            st.caption("The bank transaction is never deleted.")
             yes, no = st.columns(2)
             if yes.button("Delete", type="primary", width="stretch"):
                 with db.connect(DB_PATH) as connection:
                     db.delete_check_register_entry(
-                        connection, business_id=business_id, check_id=int(selected_check["id"]))
+                        connection, business_id=business_id, check_id=int(selected_check["id"]),
+                        reset_transaction=reset_linked)
                 st.session_state.pop("check_register_grid", None)
                 rerun()
             if no.button("Cancel", width="stretch"):

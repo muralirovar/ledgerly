@@ -170,6 +170,55 @@ class BooksTests(unittest.TestCase):
                 connection, business_id=self.business, check_id=check_id))
             self.assertEqual(db.list_check_register(connection, self.business), [])
 
+    def test_check_number_match_ranks_first_and_sync(self):
+        with db.connect(self.path) as connection:
+            other, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-09-15", posting_date=None,
+                description="WIRE OUT", source_amount=-5000, signed_amount=-5000)
+            named, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-09-20", posting_date=None,
+                description="Check #99", source_amount=-5000, signed_amount=-5000)
+            found = db.find_check_transaction_candidates(
+                connection, business_id=self.business, account_id=self.account, amount=5000,
+                cleared_date="2026-09-15", check_type="payment", check_number="99")
+            self.assertEqual([item["id"] for item in found], [named, other])
+            self.assertTrue(found[0]["number_match"])
+            self.assertFalse(found[1]["number_match"])
+            kwargs = dict(
+                business_id=self.business, account_id=self.account, bank_name="Truist",
+                account_last4="1049", statement_date="2026-09-30", check_number="99",
+                amount=5000, written_date="2026-09-10", cleared_date="2026-09-15",
+                payee="Acme LLC", memo="", category_id=self.category, treatment="Expense",
+                source_file_name="x.pdf")
+            check_id = db.confirm_check(connection, transaction_id=named, **kwargs)
+            self.assertEqual(db.get_transaction(connection, named)["status"], "confirmed")
+            # relinking to another transaction sends the old one back to review
+            db.confirm_check(connection, transaction_id=other, **kwargs)
+            self.assertEqual(db.get_transaction(connection, named)["status"], "needs_review")
+            self.assertEqual(db.get_transaction(connection, named)["treatment"], "Needs review")
+            # deleting can send the linked transaction back to review as well
+            self.assertTrue(db.delete_check_register_entry(
+                connection, business_id=self.business, check_id=check_id, reset_transaction=True))
+            self.assertEqual(db.get_transaction(connection, other)["status"], "needs_review")
+
+    def test_payee_history_and_canonical_spelling(self):
+        with db.connect(self.path) as connection:
+            db.confirm_check(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_id=None, bank_name="Truist", account_last4="1049",
+                statement_date="2026-09-30", check_number="147", amount=11000,
+                written_date="2026-09-15", cleared_date="2026-09-15",
+                payee="Colina Tech Solutions LLC", memo="Loan", category_id=None,
+                treatment="Loan receivable", source_file_name="x.pdf")
+            history = db.payee_history(connection, self.business)
+            self.assertEqual(history[0]["payee"], "Colina Tech Solutions LLC")
+            self.assertEqual(history[0]["treatment"], "Loan receivable")
+            self.assertEqual(db.canonical_payee(connection, self.business, "colina tech solutions"),
+                             "Colina Tech Solutions LLC")
+            self.assertEqual(db.canonical_payee(connection, self.business, "Someone Else"), "Someone Else")
+
     def test_loan_receivable_balance(self):
         self.assertIn("Loan receivable", db.TREATMENTS)
         with db.connect(self.path) as connection:

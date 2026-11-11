@@ -34,6 +34,13 @@ ACCOUNT_TYPES = (
 )
 
 CHECK_TYPES = ("payment", "deposit")
+LOAN_TREATMENTS = ("Loan draw", "Principal repayment", "Loan receivable", "Receivable repayment")
+LOAN_ROLES = {
+    "Loan draw": "Borrowed from",
+    "Principal repayment": "Repaid to",
+    "Loan receivable": "Lent to",
+    "Receivable repayment": "Repaid by",
+}
 
 
 def utc_now() -> str:
@@ -198,6 +205,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     treatment TEXT NOT NULL DEFAULT 'Needs review',
     status TEXT NOT NULL DEFAULT 'needs_review',
     related_account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+    counterparty TEXT,
     source_file TEXT,
     source_reference TEXT,
     notes TEXT,
@@ -317,6 +325,15 @@ def init_db(db_path: str | Path) -> None:
     with connect(db_path) as connection:
         connection.executescript(SCHEMA)
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(check_register)")}
+        transaction_columns = {row["name"] for row in connection.execute("PRAGMA table_info(transactions)")}
+        if "counterparty" not in transaction_columns:
+            connection.execute("ALTER TABLE transactions ADD COLUMN counterparty TEXT")
+            connection.execute(
+                """UPDATE transactions SET counterparty = (
+                       SELECT r.payee FROM check_register r
+                       WHERE r.transaction_id = transactions.id AND TRIM(COALESCE(r.payee, '')) <> ''
+                       ORDER BY r.id LIMIT 1)
+                   WHERE counterparty IS NULL""")
         if "check_type" not in columns:
             connection.execute(
                 "ALTER TABLE check_register ADD COLUMN check_type TEXT NOT NULL DEFAULT 'payment'"
@@ -916,7 +933,7 @@ def list_transactions(
             f"""SELECT t.id, t.transaction_date, t.posting_date, a.name AS account,
                        t.description, t.source_amount, t.signed_amount,
                        t.source_category, c.name AS category, t.treatment,
-                       t.status, t.source_file, t.source_reference, t.notes
+                       t.counterparty, t.status, t.source_file, t.source_reference, t.notes
                 FROM transactions t
                 JOIN accounts a ON a.id = t.account_id
                 LEFT JOIN categories c ON c.id = t.category_id
@@ -1219,6 +1236,9 @@ def confirm_check(
     )
     if previous and previous["transaction_id"] and previous["transaction_id"] != transaction_id:
         reset_transaction_review(connection, int(previous["transaction_id"]))
+    if transaction_id and payee.strip():
+        connection.execute(
+            "UPDATE transactions SET counterparty = ? WHERE id = ?", (payee.strip(), transaction_id))
     if transaction_id and treatment:
         update_transaction_classification(
             connection, transaction_id, category_id=category_id, treatment=treatment,
@@ -1270,9 +1290,11 @@ def delete_check_register_entry(
     return True
 
 
-def _payee_key(name: str) -> str:
+def _payee_key(name: str, loose: bool = True) -> str:
+    """Comparison key for a counterparty name. Loose also ignores LLC/Inc-style suffixes."""
     key = re.sub(r"[^a-z0-9 ]", " ", (name or "").lower())
-    key = re.sub(r"\b(llc|l l c|inc|incorporated|corp|corporation|co|ltd|llp)\b", " ", key)
+    if loose:
+        key = re.sub(r"\b(llc|l l c|inc|incorporated|corp|corporation|co|ltd|llp)\b", " ", key)
     return " ".join(key.split())
 
 
@@ -1294,13 +1316,44 @@ def payee_history(connection: sqlite3.Connection, business_id: int) -> list[dict
     return sorted(seen.values(), key=lambda item: item["payee"].lower())
 
 
-def canonical_payee(connection: sqlite3.Connection, business_id: int, payee: str) -> str:
-    """Existing spelling of a counterparty that matches ignoring case, punctuation and LLC/Inc."""
-    key = _payee_key(payee)
+def canonical_payee(connection: sqlite3.Connection, business_id: int, payee: str, loose: bool = True) -> str:
+    """Existing spelling of a counterparty that matches ignoring case and punctuation.
+
+    With ``loose`` (the default) LLC/Inc-style suffixes are ignored too.
+    """
+    key = _payee_key(payee, loose)
     for item in payee_history(connection, business_id):
-        if _payee_key(item["payee"]) == key:
+        if _payee_key(item["payee"], loose) == key:
             return item["payee"]
+    for row in connection.execute(
+        """SELECT DISTINCT counterparty FROM transactions
+           WHERE business_id = ? AND TRIM(COALESCE(counterparty, '')) <> ''""", (business_id,)):
+        if _payee_key(row["counterparty"], loose) == key:
+            return row["counterparty"].strip()
     return payee.strip()
+
+
+def set_transaction_counterparty(
+    connection: sqlite3.Connection, *, business_id: int, transaction_id: int, counterparty: str
+) -> str:
+    """Set who a transaction was paid to / received from (the lender or borrower for loans).
+
+    Reuses the existing spelling when only case or punctuation differs (an explicit change of
+    suffix, such as Corp to Inc, is respected), and keeps a single
+    linked check-register entry in step. Returns the name that was stored.
+    """
+    name = canonical_payee(connection, business_id, counterparty, loose=False) if counterparty.strip() else ""
+    cursor = connection.execute(
+        "UPDATE transactions SET counterparty = ?, updated_at = ? WHERE id = ? AND business_id = ?",
+        (name or None, utc_now(), transaction_id, business_id))
+    if cursor.rowcount == 0:
+        raise ValueError("Transaction not found.")
+    linked = connection.execute(
+        "SELECT id FROM check_register WHERE transaction_id = ?", (transaction_id,)).fetchall()
+    if len(linked) == 1:
+        connection.execute("UPDATE check_register SET payee = ?, updated_at = ? WHERE id = ?",
+                           (name, utc_now(), linked[0]["id"]))
+    return name
 
 
 def list_loan_receivables(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
@@ -1310,9 +1363,13 @@ def list_loan_receivables(connection: sqlite3.Connection, business_id: int) -> l
     as a receivable but not linked to a register entry are grouped separately.
     """
     totals: dict[str, dict[str, float]] = {}
+    display: dict[str, str] = {}
 
     def add(name: str, treatment: str, amount: float) -> None:
-        row = totals.setdefault(name, {"lent": 0.0, "repaid": 0.0})
+        key = _payee_key(name) or name
+        if len(name) > len(display.get(key, "")):  # prefer the fuller spelling, e.g. with "LLC"
+            display[key] = name
+        row = totals.setdefault(key, {"lent": 0.0, "repaid": 0.0})
         row["lent" if treatment == "Loan receivable" else "repaid"] += abs(float(amount))
 
     for row in connection.execute(
@@ -1322,16 +1379,17 @@ def list_loan_receivables(connection: sqlite3.Connection, business_id: int) -> l
     ):
         add((row["payee"] or "").strip() or "(No counterparty recorded)", row["treatment"], row["amount"])
     for row in connection.execute(
-        """SELECT t.treatment, t.signed_amount FROM transactions t
+        """SELECT t.treatment, t.signed_amount, t.counterparty FROM transactions t
            WHERE t.business_id = ? AND t.treatment IN ('Loan receivable', 'Receivable repayment')
              AND NOT EXISTS (SELECT 1 FROM check_register r WHERE r.transaction_id = t.id)""",
         (business_id,),
     ):
-        add("(Bank transactions without a counterparty)", row["treatment"], row["signed_amount"])
+        add((row["counterparty"] or "").strip() or "(Bank transactions without a counterparty)",
+            row["treatment"], row["signed_amount"])
     return [
-        {"counterparty": name, "lent": round(v["lent"], 2), "repaid": round(v["repaid"], 2),
+        {"counterparty": display[key], "lent": round(v["lent"], 2), "repaid": round(v["repaid"], 2),
          "balance_owed": round(v["lent"] - v["repaid"], 2)}
-        for name, v in sorted(totals.items())
+        for key, v in sorted(totals.items(), key=lambda item: display[item[0]].lower())
     ]
 
 

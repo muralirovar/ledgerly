@@ -1277,6 +1277,10 @@ elif page == "Review Queue":
                             connection, int(row["id"]), category_id=category_id,
                             treatment=treatment, related_account_id=related_options[related_name], notes=notes,
                             pattern=pattern, apply_existing=apply_existing)
+                    if treatment in db.LOAN_TREATMENTS and vendor_name.strip():
+                        db.set_transaction_counterparty(
+                            connection, business_id=business_id, transaction_id=int(row["id"]),
+                            counterparty=vendor_name)
                 st.success(f"Saved. {max(applied - (1 if save_vendor else 0), 0)} other matching waiting transaction(s) were classified.")
                 rerun()
 
@@ -1296,6 +1300,8 @@ elif page == "Transactions":
         st.stop()
     frame["transaction_date"] = pd.to_datetime(frame["transaction_date"], errors="coerce")
     frame["category"] = frame["category"].fillna("Uncategorized")
+    frame["counterparty"] = frame["counterparty"].fillna("")
+    frame["loan_role"] = frame["treatment"].map(db.LOAN_ROLES).fillna("")
     f1, f2, f3, f4 = st.columns(4)
     with f1:
         account_filters = st.multiselect("Accounts", sorted(frame["account"].dropna().unique()),
@@ -1333,6 +1339,7 @@ elif page == "Transactions":
         "Date": "transaction_date", "Account": "account", "Description": "description",
         "Amount": "signed_amount", "Category": "category", "Treatment": "treatment",
         "Status": "status", "Reference": "source_reference", "Notes": "notes",
+        "Counterparty / loan party": "counterparty", "Loan role": "loan_role",
     }
     with sort1:
         sort_label = st.selectbox("Sort by", list(sortable_columns))
@@ -1349,13 +1356,14 @@ elif page == "Transactions":
                            file_name=f"{db.slugify(business_name)}-filtered-transactions.csv",
                            mime="text/csv", width="stretch")
     section_label("Editable transaction grid")
-    st.caption("Check rows for bulk changes. Edit Category or Treatment directly; copy/paste and drag-fill work like a spreadsheet.")
+    st.caption("Check rows for bulk changes. Edit Category, Treatment or Counterparty directly; copy/paste and drag-fill work like a spreadsheet. "
+               "For loans, Counterparty is who you borrowed from or lent to — the Loan role column shows which.")
     category_names = [item["name"] for item in categories]
     category_by_name = {item["name"]: item for item in categories}
     select_all_visible = st.checkbox("Check all filtered transactions", value=False,
                                      help="Selects every transaction matching the current search and filters.")
     editor_columns = ["id", "transaction_date", "account", "description", "signed_amount", "category",
-                      "treatment", "status", "source_reference", "notes"]
+                      "treatment", "loan_role", "counterparty", "status", "source_reference", "notes"]
     editor_source = filtered[editor_columns].copy()
     editor_source.insert(0, "Select", select_all_visible)
     editor_source = editor_source.set_index("id", drop=False)
@@ -1368,9 +1376,9 @@ elif page == "Transactions":
         height=650,
         key=editor_key,
         disabled=["id", "transaction_date", "account", "description", "signed_amount",
-                  "status", "source_reference", "notes"],
+                  "loan_role", "status", "source_reference", "notes"],
         column_order=["Select", "transaction_date", "account", "description", "signed_amount",
-                      "category", "treatment", "status", "source_reference", "notes"],
+                      "category", "treatment", "loan_role", "counterparty", "status", "source_reference", "notes"],
         column_config={
             "Select": st.column_config.CheckboxColumn("Select", help="Select rows for a bulk category change"),
             "transaction_date": st.column_config.TextColumn("Date"),
@@ -1379,21 +1387,33 @@ elif page == "Transactions":
                                                            required=True),
             "treatment": st.column_config.SelectboxColumn("Treatment", options=list(db.TREATMENTS[:-1]),
                                                             required=True),
+            "loan_role": st.column_config.TextColumn("Loan role", help="Borrowed from, Repaid to, Lent to or Repaid by"),
+            "counterparty": st.column_config.TextColumn(
+                "Counterparty / loan party", help="Who you paid or received from. For loans: the lender or borrower."),
         },
     )
     changed_ids = []
+    counterparty_changed_ids = []
     for transaction_id, edited_row in edited.iterrows():
         original_row = editor_source.loc[transaction_id]
         if (edited_row["category"] != original_row["category"] or
                 edited_row["treatment"] != original_row["treatment"]):
             changed_ids.append(int(transaction_id))
+        if str(edited_row["counterparty"] or "").strip() != str(original_row["counterparty"] or "").strip():
+            counterparty_changed_ids.append(int(transaction_id))
+    unsaved_total = len(set(changed_ids) | set(counterparty_changed_ids))
     selected_ids = [int(transaction_id) for transaction_id, row in edited.iterrows() if bool(row["Select"])]
     save1, save2 = st.columns([1, 2])
     with save1:
-        if st.button(f"Save {len(changed_ids):,} edited row(s)", type="primary", width="stretch",
-                     disabled=not changed_ids):
+        if st.button(f"Save {unsaved_total:,} edited row(s)", type="primary", width="stretch",
+                     disabled=not unsaved_total):
             saved = 0
             with db.connect(DB_PATH) as connection:
+                for transaction_id in counterparty_changed_ids:
+                    db.set_transaction_counterparty(
+                        connection, business_id=business_id, transaction_id=transaction_id,
+                        counterparty=str(edited.loc[transaction_id]["counterparty"] or ""))
+                    saved += 1
                 for transaction_id in changed_ids:
                     row = edited.loc[transaction_id]
                     category_name = str(row["category"] or "Uncategorized")
@@ -1404,11 +1424,11 @@ elif page == "Transactions":
                     else:
                         db.classify_transaction(connection, transaction_id, category_id=category_id,
                                                 treatment=str(row["treatment"]), apply_existing=False)
-                    saved += 1
+                    saved += 1 if transaction_id not in counterparty_changed_ids else 0
             st.success(f"Saved {saved} row(s). Category choices were learned as local rules.")
             rerun()
     with save2:
-        st.caption(f"{len(selected_ids):,} row(s) selected for bulk actions · {len(changed_ids):,} unsaved cell edit(s)")
+        st.caption(f"{len(selected_ids):,} row(s) selected for bulk actions · {unsaved_total:,} unsaved row edit(s)")
     section_label("Bulk category action")
     bulk1, bulk2, bulk3 = st.columns([2, 2, 1])
     with bulk1:

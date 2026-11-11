@@ -380,6 +380,61 @@ class BooksTests(unittest.TestCase):
         self.assertIsNone(statements.resolve_check_index(checks, {"name": "x.pdf", "check_index": None}))
         self.assertEqual(statements.resolve_check_index(checks, {"name": "11000.pdf"}), 0)
 
+    def test_transaction_counterparty_for_loans(self):
+        with db.connect(self.path) as connection:
+            wire, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-10-02", posting_date=None,
+                description="WIRE OUT", source_amount=-4000, signed_amount=-4000)
+            db.update_transaction_classification(connection, wire, category_id=None, treatment="Loan receivable")
+            self.assertEqual(db.list_loan_receivables(connection, self.business)[0]["counterparty"],
+                             "(Bank transactions without a counterparty)")
+            stored = db.set_transaction_counterparty(
+                connection, business_id=self.business, transaction_id=wire, counterparty="Colina Tech Solutions LLC")
+            self.assertEqual(stored, "Colina Tech Solutions LLC")
+            row = next(r for r in db.list_transactions(connection, self.business) if r["id"] == wire)
+            self.assertEqual(row["counterparty"], "Colina Tech Solutions LLC")
+            self.assertEqual(db.list_loan_receivables(connection, self.business),
+                             [{"counterparty": "Colina Tech Solutions LLC", "lent": 4000.0,
+                               "repaid": 0.0, "balance_owed": 4000.0}])
+            # case/punctuation differences reuse the existing spelling; a different suffix is respected
+            other, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-10-05", posting_date=None,
+                description="WIRE IN", source_amount=1000, signed_amount=1000)
+            db.update_transaction_classification(connection, other, category_id=None, treatment="Receivable repayment")
+            self.assertEqual(db.set_transaction_counterparty(
+                connection, business_id=self.business, transaction_id=other, counterparty="colina tech solutions, llc"),
+                "Colina Tech Solutions LLC")
+            self.assertEqual(db.list_loan_receivables(connection, self.business)[0]["balance_owed"], 3000.0)
+            self.assertEqual(db.LOAN_ROLES["Loan draw"], "Borrowed from")
+            # confirming a check copies the payee onto the linked transaction, and edits flow back
+            check_txn, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-10-06", posting_date=None,
+                description="Check #50", source_amount=-700, signed_amount=-700)
+            db.confirm_check(
+                connection, business_id=self.business, account_id=self.account, transaction_id=check_txn,
+                bank_name="Truist", account_last4="", statement_date="2026-10-31", check_number="50",
+                amount=700, written_date=None, cleared_date="2026-10-06", payee="Acme Corp", memo="",
+                category_id=None, treatment="Expense", source_file_name="x.pdf")
+            self.assertEqual(next(r for r in db.list_transactions(connection, self.business)
+                                  if r["id"] == check_txn)["counterparty"], "Acme Corp")
+            db.set_transaction_counterparty(
+                connection, business_id=self.business, transaction_id=check_txn, counterparty="Acme Inc")
+            self.assertEqual(db.list_check_register(connection, self.business)[0]["payee"], "Acme Inc")
+            # balances merge spellings that differ only by suffix
+            merged, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-10-07", posting_date=None,
+                description="WIRE OUT 2", source_amount=-500, signed_amount=-500)
+            db.update_transaction_classification(connection, merged, category_id=None, treatment="Loan receivable")
+            db.set_transaction_counterparty(
+                connection, business_id=self.business, transaction_id=merged, counterparty="Colina Tech Solutions")
+            rows = db.list_loan_receivables(connection, self.business)
+            self.assertEqual([(r["counterparty"], r["balance_owed"]) for r in rows],
+                             [("Colina Tech Solutions LLC", 3500.0)])
+
     def test_loan_receivable_balance(self):
         self.assertIn("Loan receivable", db.TREATMENTS)
         with db.connect(self.path) as connection:

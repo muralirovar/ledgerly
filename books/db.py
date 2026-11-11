@@ -353,6 +353,10 @@ def list_accounts(connection: sqlite3.Connection, business_id: int) -> list[dict
     ]
 
 
+def set_account_last4(connection: sqlite3.Connection, account_id: int, last4: str) -> None:
+    connection.execute("UPDATE accounts SET last4 = ? WHERE id = ?", (last4.strip()[-4:], account_id))
+
+
 def update_account(
     connection: sqlite3.Connection,
     account_id: int,

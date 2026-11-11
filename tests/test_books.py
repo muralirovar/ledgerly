@@ -219,6 +219,48 @@ class BooksTests(unittest.TestCase):
                              "Colina Tech Solutions LLC")
             self.assertEqual(db.canonical_payee(connection, self.business, "Someone Else"), "Someone Else")
 
+    def test_truist_text_parser(self):
+        from books import statements
+        text = ("TRUIST BANK\nFor 09/30/2026\nBUSINESS CHECKING 1000091049\n"
+                "previous balance as of 08/31/2026 $10,000.00\nnew balance as of 09/30/2026 = $5,000.00\n"
+                "Checks\nDATE CHECK # AMOUNT\n09/15 147 11,000.00\n09/16 *148 250.00\n"
+                "Other withdrawals, debits and service charges\nTotal checks = $11,250.00\n")
+        parsed = statements.parse_truist_text(text, 2)
+        self.assertEqual(parsed["statement_date"], "2026-09-30")
+        self.assertEqual(parsed["account_last4"], "1049")
+        self.assertEqual([(c["check_number"], c["cleared_date"], c["amount"]) for c in parsed["checks"]],
+                         [("147", "2026-09-15", 11000.0), ("148", "2026-09-16", 250.0)])
+        self.assertEqual(parsed["check_total"], 11250.0)
+        with self.assertRaises(ValueError):
+            statements.parse_truist_text("Some other bank", 1)
+
+    def test_boa_text_parser(self):
+        from books import statements
+        text = ("Bank of America\nYour checking account for September 1, 2026 to September 30, 2026\n"
+                "Account number: 1234 5678 9012\nBeginning balance on September 1, 2026 $1,000.00\n"
+                "Ending balance on September 30, 2026 $500.00\nChecks\nDate Check # Amount\n"
+                "09/15/26 147 -11,000.00\n09/16/26 149* -250.00\nTotal checks -$11,250.00\n")
+        parsed = statements.parse_boa_text(text, 3)
+        self.assertEqual(parsed["statement_date"], "2026-09-30")
+        self.assertEqual(parsed["account_last4"], "9012")
+        self.assertEqual([c["check_number"] for c in parsed["checks"]], ["147", "149"])
+        self.assertEqual(parsed["check_total"], 11250.0)
+        self.assertEqual(parsed["closing_balance"], 500.0)
+
+    def test_check_file_matching_and_account_last4(self):
+        from books import statements
+        checks = [{"check_number": "147", "amount": 11000.0}, {"check_number": "148", "amount": 250.0},
+                  {"check_number": "149", "amount": 250.0}]
+        self.assertEqual(statements.match_check_index(checks, "11000.pdf"), 0)
+        self.assertEqual(statements.match_check_index(checks, "250-149.pdf"), 2)
+        self.assertIsNone(statements.match_check_index(checks, "250.pdf"))
+        self.assertIsNone(statements.match_check_index(checks, "scan.pdf"))
+        with db.connect(self.path) as connection:
+            db.set_account_last4(connection, self.account, "xx1049")
+            self.assertEqual(
+                next(a for a in db.list_accounts(connection, self.business) if a["id"] == self.account)["last4"],
+                "1049")
+
     def test_loan_receivable_balance(self):
         self.assertIn("Loan receivable", db.TREATMENTS)
         with db.connect(self.path) as connection:

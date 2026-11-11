@@ -45,7 +45,10 @@ def parse_truist_statement(pdf_bytes: bytes) -> dict[str, Any]:
     reader = PdfReader(BytesIO(pdf_bytes))
     if not reader.pages:
         raise ValueError("The statement has no pages.")
-    first_page = reader.pages[0].extract_text() or ""
+    return parse_truist_text(reader.pages[0].extract_text() or "", len(reader.pages))
+
+
+def parse_truist_text(first_page: str, page_count: int) -> dict[str, Any]:
     if "TRUIST" not in first_page.upper():
         raise ValueError("This does not appear to be a Truist statement.")
 
@@ -78,7 +81,7 @@ def parse_truist_statement(pdf_bytes: bytes) -> dict[str, Any]:
         "closing_balance": _money(closing_match.group(1)) if closing_match else None,
         "check_total": _money(total_match.group(1)) if total_match else sum(item.amount for item in checks),
         "checks": [asdict(item) for item in checks],
-        "page_count": len(reader.pages),
+        "page_count": page_count,
     }
 
 
@@ -86,7 +89,10 @@ def parse_boa_statement(pdf_bytes: bytes) -> dict[str, Any]:
     reader = PdfReader(BytesIO(pdf_bytes))
     if not reader.pages:
         raise ValueError("The statement has no pages.")
-    text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    return parse_boa_text("\n".join((page.extract_text() or "") for page in reader.pages), len(reader.pages))
+
+
+def parse_boa_text(text: str, page_count: int) -> dict[str, Any]:
     if "BANK OF AMERICA" not in text.upper():
         raise ValueError("This does not appear to be a Bank of America statement.")
 
@@ -132,7 +138,7 @@ def parse_boa_statement(pdf_bytes: bytes) -> dict[str, Any]:
         "closing_balance": _money(closing_match.group(1)) if closing_match else None,
         "check_total": check_total or sum(item.amount for item in checks),
         "checks": [asdict(item) for item in checks],
-        "page_count": len(reader.pages),
+        "page_count": page_count,
     }
 
 

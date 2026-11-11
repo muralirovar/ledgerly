@@ -619,6 +619,14 @@ elif page == "Statements & Checks":
                     hide_index=True, width="stretch",
                     column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
         selected_account = account_by_name[selected_account_name]
+        if parsed["account_last4"] and not selected_account.get("last4"):
+            note_col, save_col = st.columns([3, 1])
+            note_col.info(f"“{selected_account_name}” has no account number saved, so the account check can't run. "
+                          f"This statement is for an account ending {parsed['account_last4']}.")
+            if save_col.button(f"Save ending {parsed['account_last4']}", key="save_account_last4"):
+                with db.connect(DB_PATH) as connection:
+                    db.set_account_last4(connection, int(selected_account["id"]), parsed["account_last4"])
+                rerun()
         if selected_account.get("last4") and parsed["account_last4"] and str(selected_account["last4"])[-4:] != parsed["account_last4"]:
             st.warning("The statement account ending does not match the selected account. Choose the correct account before confirming anything.")
 
@@ -659,6 +667,11 @@ elif page == "Statements & Checks":
             st.dataframe(pd.DataFrame(needed_rows), hide_index=True, width="stretch",
                          column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
 
+        stray_files = [item["name"] for item in image_sets
+                       if checks and statements.match_check_index(checks, item["name"]) is None]
+        if stray_files:
+            st.warning("These uploaded files don't match any check on the statement by amount or check number, "
+                       "so you'll have to pick the check yourself: " + ", ".join(stray_files))
         section_label(f"{'4' if parsed['bank'] == 'Truist' else '3'} · Identify and confirm each check")
         if not image_sets:
             st.info("The statement is ready. Add downloaded check image PDFs above to identify payees and create register entries.")
@@ -679,6 +692,7 @@ elif page == "Statements & Checks":
             elif checks:
                 st.caption("No uploaded check image points at an unmapped check.")
             suggested_index = statements.suggest_check_index(checks, active_image_name) if checks else 0
+            guessed = bool(checks) and statements.match_check_index(checks, active_image_name) is None
             check_labels = [
                 f"#{item['check_number']} · {item['cleared_date']} · {money(float(item['amount']))}"
                 f" · {'✓ Mapped' if mapped_check(item) else 'Unmapped'}"
@@ -692,6 +706,9 @@ elif page == "Statements & Checks":
                         st.image(image_bytes, caption="Front" if index == 0 else "Back", width="stretch")
                 with confirm_column:
                     st.markdown("#### Confirm this check")
+                    if guessed:
+                        st.warning(f"“{active_image_name}” doesn't match a check by amount or number. "
+                                   "The first check is selected only as a placeholder — choose the right one below.")
                     chosen_label = st.selectbox("Statement check", check_labels, index=suggested_index,
                                                 key=f"statement_check_{active_image_name}")
                     chosen = checks[check_labels.index(chosen_label)]

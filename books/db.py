@@ -1477,19 +1477,70 @@ def log_statement_reconciliation(
     return log_id
 
 
+def ensure_deposit_log_entries(connection: sqlite3.Connection, business_id: int) -> None:
+    """Make sure every deposited check belongs to a statement in the log.
+
+    A deposit is filed under the first logged statement of its account that ends on or after
+    the deposit date; if there is none, a deposits-only entry is created for that month.
+    """
+    for row in connection.execute(
+        """SELECT r.account_id, r.cleared_date, r.statement_date, r.bank_name, r.account_last4
+           FROM check_register r WHERE r.business_id = ? AND r.check_type = 'deposit'""",
+        (business_id,)).fetchall():
+        covered = connection.execute(
+            "SELECT 1 FROM statement_log WHERE business_id=? AND account_id=? AND statement_date >= ? LIMIT 1",
+            (business_id, row["account_id"], row["cleared_date"])).fetchone()
+        if covered:
+            continue
+        now = utc_now()
+        connection.execute(
+            """INSERT OR IGNORE INTO statement_log(business_id, account_id, bank_name, account_last4, statement_date,
+                   statement_file_name, statement_check_total, checks_listed, checks_mapped, mapped_total,
+                   status, first_logged_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, NULL, 0, 0, 0, 0, 'Deposits only', ?, ?)""",
+            (business_id, row["account_id"], row["bank_name"] or "", row["account_last4"] or "",
+             row["statement_date"], now, now))
+
+
+def _deposits_by_log(connection: sqlite3.Connection, business_id: int) -> dict[int, list[dict[str, Any]]]:
+    """Deposited checks grouped under the statement (log entry) that covers their date."""
+    logs: dict[int, list[tuple[str, int]]] = {}
+    for row in connection.execute(
+        "SELECT id, account_id, statement_date FROM statement_log WHERE business_id = ? ORDER BY statement_date",
+        (business_id,)):
+        logs.setdefault(int(row["account_id"]), []).append((row["statement_date"], int(row["id"])))
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        """SELECT * FROM check_register WHERE business_id = ? AND check_type = 'deposit'
+           ORDER BY cleared_date, id""", (business_id,)):
+        for statement_date, log_id in logs.get(int(row["account_id"]), []):
+            if statement_date >= row["cleared_date"]:
+                grouped.setdefault(log_id, []).append(dict(row))
+                break
+    return grouped
+
+
 def list_statement_log(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
-    return [dict(row) for row in connection.execute(
+    ensure_deposit_log_entries(connection, business_id)
+    deposits = _deposits_by_log(connection, business_id)
+    rows = [dict(row) for row in connection.execute(
         """SELECT l.id, l.statement_file_name, l.bank_name, a.name AS account, l.account_last4,
                   l.statement_date, l.checks_listed, l.checks_mapped, l.statement_check_total,
                   l.mapped_total, l.status, l.first_logged_at, l.updated_at
            FROM statement_log l JOIN accounts a ON a.id = l.account_id
            WHERE l.business_id = ? ORDER BY l.statement_date DESC, l.id DESC""",
         (business_id,))]
+    for row in rows:
+        mine = deposits.get(int(row["id"]), [])
+        row["deposits_reconciled"] = len(mine)
+        row["deposit_total"] = round(sum(float(item["amount"]) for item in mine), 2)
+    return rows
 
 
 def statement_log_rows(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
-    """One row per statement check, with the statement details repeated: ready for CSV/Excel archiving."""
-    return [dict(row) for row in connection.execute(
+    """One row per statement check and per deposited check, statement details repeated: ready for CSV/Excel archiving."""
+    ensure_deposit_log_entries(connection, business_id)
+    rows = [dict(row) for row in connection.execute(
         """SELECT l.statement_file_name AS statement_file, l.bank_name AS bank, a.name AS account,
                   l.account_last4, l.statement_date, l.status AS statement_status,
                   k.check_number, k.cleared_date, k.amount,
@@ -1502,6 +1553,28 @@ def statement_log_rows(connection: sqlite3.Connection, business_id: int) -> list
            WHERE l.business_id = ?
            ORDER BY l.statement_date DESC, l.id DESC, CAST(k.check_number AS INTEGER)""",
         (business_id,))]
+    deposits = _deposits_by_log(connection, business_id)
+    if deposits:
+        meta = {int(r["id"]): dict(r) for r in connection.execute(
+            """SELECT l.id, l.statement_file_name, l.bank_name, a.name AS account, l.account_last4,
+                      l.statement_date, l.status, l.updated_at
+               FROM statement_log l JOIN accounts a ON a.id = l.account_id WHERE l.business_id = ?""",
+            (business_id,))}
+        for log_id, items in deposits.items():
+            info = meta[log_id]
+            for item in items:
+                rows.append({
+                    "statement_file": info["statement_file_name"], "bank": info["bank_name"],
+                    "account": info["account"], "account_last4": info["account_last4"],
+                    "statement_date": info["statement_date"], "statement_status": info["status"],
+                    "check_number": item["check_number"], "cleared_date": item["cleared_date"],
+                    "amount": item["amount"], "reconciled": "Yes", "direction": "deposit",
+                    "counterparty": item["payee"], "treatment": item["treatment"],
+                    "transaction_id": item["transaction_id"], "check_image_file": item["source_file_name"],
+                    "logged_at": info["updated_at"]})
+        rows.sort(key=lambda r: (str(r["statement_date"]), str(r["account"]), str(r["direction"] or ""),
+                                 str(r["cleared_date"])), reverse=True)
+    return rows
 
 
 _CHECK_DEPOSIT_HINT = re.compile(
@@ -1555,6 +1628,50 @@ def list_deposits(
     return rows
 
 
+def suggest_transfer_counterpart(
+    connection: sqlite3.Connection, business_id: int, transaction_id: int,
+) -> dict[str, Any] | None:
+    """Guess the other side of an internal transfer from records already in the books.
+
+    First looks for the opposite leg (same amount, opposite sign, another account of this
+    business, within a week). Then falls back to how similar past transfers on this account
+    were recorded. Returns related_account_id, related_account_name, counterparty and reason.
+    """
+    txn = connection.execute(
+        "SELECT * FROM transactions WHERE id = ? AND business_id = ?", (transaction_id, business_id)).fetchone()
+    if txn is None:
+        return None
+    leg = connection.execute(
+        """SELECT t.transaction_date, t.account_id, a.name AS account_name
+           FROM transactions t JOIN accounts a ON a.id = t.account_id
+           WHERE t.business_id = ? AND t.account_id <> ? AND ABS(t.signed_amount + ?) < 0.005
+             AND ABS(julianday(t.transaction_date) - julianday(?)) <= 7
+           ORDER BY (t.treatment = 'Transfer') DESC, (t.status = 'needs_review') DESC,
+                    ABS(julianday(t.transaction_date) - julianday(?)), t.id LIMIT 1""",
+        (business_id, txn["account_id"], txn["signed_amount"], txn["transaction_date"],
+         txn["transaction_date"])).fetchone()
+    if leg:
+        return {"related_account_id": int(leg["account_id"]), "related_account_name": leg["account_name"],
+                "counterparty": leg["account_name"],
+                "reason": f"Matching {abs(float(txn['signed_amount'])):,.2f} on {leg['transaction_date']} in {leg['account_name']}"}
+    pattern = suggested_vendor_pattern(txn["description"])
+    if len(pattern) >= 6:
+        rows = connection.execute(
+            """SELECT t.related_account_id, a.name AS account_name, t.counterparty, COUNT(*) AS n
+               FROM transactions t LEFT JOIN accounts a ON a.id = t.related_account_id
+               WHERE t.business_id = ? AND t.account_id = ? AND t.id <> ? AND t.treatment = 'Transfer'
+                 AND (t.related_account_id IS NOT NULL OR TRIM(COALESCE(t.counterparty, '')) <> '')
+                 AND t.normalized_description LIKE ?
+               GROUP BY t.related_account_id, t.counterparty ORDER BY n DESC LIMIT 1""",
+            (business_id, txn["account_id"], transaction_id, f"%{pattern}%")).fetchall()
+        if rows:
+            row = rows[0]
+            return {"related_account_id": row["related_account_id"], "related_account_name": row["account_name"],
+                    "counterparty": row["counterparty"] or row["account_name"] or "",
+                    "reason": f"Recorded this way on {row['n']} earlier similar transfer(s)"}
+    return None
+
+
 DEPOSIT_TREATMENTS = (
     "Revenue", "Loan draw", "Transfer", "Owner contribution", "Receivable repayment",
     "Revenue refund", "Expense refund", "Excluded",
@@ -1565,6 +1682,7 @@ def classify_deposits(
     connection: sqlite3.Connection, *, business_id: int, transaction_ids: list[int],
     treatment: str, counterparty: str = "", category_id: int | None = None,
     related_account_id: int | None = None, notes: str | None = None,
+    fill_transfer_from_records: bool = False,
 ) -> int:
     """Account for several deposits at once. Only credits of this business are touched."""
     if treatment not in DEPOSIT_TREATMENTS:
@@ -1576,13 +1694,20 @@ def classify_deposits(
             (int(transaction_id), business_id)).fetchone()
         if not row:
             continue
+        related = related_account_id
+        party = counterparty
+        if treatment == "Transfer" and fill_transfer_from_records and (related is None or not party.strip()):
+            guess = suggest_transfer_counterpart(connection, business_id, int(transaction_id))
+            if guess:
+                related = related if related is not None else guess["related_account_id"]
+                party = party if party.strip() else (guess["counterparty"] or "")
         update_transaction_classification(
             connection, int(transaction_id), category_id=category_id, treatment=treatment,
-            related_account_id=related_account_id, notes=notes or None)
-        if counterparty.strip():
+            related_account_id=related, notes=notes or None)
+        if party.strip():
             set_transaction_counterparty(
                 connection, business_id=business_id, transaction_id=int(transaction_id),
-                counterparty=counterparty)
+                counterparty=party)
         done += 1
     return done
 
@@ -1653,4 +1778,5 @@ def confirm_deposit_checks(
             cleared_date=cleared, payee=str(item.get("payer") or ""), memo=str(item.get("memo") or ""),
             category_id=category_id, treatment=treatment,
             source_file_name=str(item.get("image_file") or ""), check_type="deposit"))
+    ensure_deposit_log_entries(connection, business_id)
     return ids

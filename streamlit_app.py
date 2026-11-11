@@ -1147,15 +1147,17 @@ elif page == "Statements & Checks":
                 "statement_file_name": "Statement file", "bank_name": "Bank", "account": "Account",
                 "account_last4": "Ending", "statement_date": "Statement date", "checks_listed": "Checks listed",
                 "checks_mapped": "Reconciled", "statement_check_total": "Statement total", "mapped_total": "Reconciled total",
+                "deposits_reconciled": "Deposits reconciled", "deposit_total": "Deposit total",
                 "status": "Status", "first_logged_at": "First logged", "updated_at": "Last updated"}).drop(columns=["id"])
             st.dataframe(log_frame, hide_index=True, width="stretch", column_config={
                 "Statement total": st.column_config.NumberColumn(format="$%.2f"),
-                "Reconciled total": st.column_config.NumberColumn(format="$%.2f")})
+                "Reconciled total": st.column_config.NumberColumn(format="$%.2f"),
+                "Deposit total": st.column_config.NumberColumn(format="$%.2f")})
             st.download_button(
                 "Download log with every check (CSV)", type="primary",
                 data=pd.DataFrame(shown_log_rows).to_csv(index=False).encode("utf-8"),
                 file_name=f"{db.slugify(business_name)}-statement-reconciliation-log.csv", mime="text/csv",
-                help="One row per check for the statements shown above, ready to archive next to the statement.")
+                help="One row per check and deposited check for the statements shown above, ready to archive next to the statement.")
         else:
             st.info("No statements match these filters.")
     else:
@@ -1327,9 +1329,21 @@ elif page == "Deposits":
             cat_by_name = {c["name"]: int(c["id"]) for c in revenue_cats}
             cat_pick = c1.selectbox("Revenue category", ["— No category —"] + list(cat_by_name), key="dep_category")
             category_id = cat_by_name.get(cat_pick)
+        fill_from_records = False
         if treatment == "Transfer":
+            fill_from_records = st.checkbox(
+                "Fill the other account from my records (matching opposite entry or earlier similar transfers)",
+                value=True, key="dep_fill_transfer")
+            if fill_from_records and chosen_ids:
+                with db.connect(DB_PATH) as connection:
+                    guesses = [(i, db.suggest_transfer_counterpart(connection, business_id, i)) for i in chosen_ids]
+                shown = [{"Deposit": f"{money(float(edited.loc[edited['ID'] == i, 'Amount'].iloc[0]))} · "
+                                      f"{edited.loc[edited['ID'] == i, 'Date'].iloc[0]}",
+                          "From account": (g or {}).get("related_account_name") or "— no match, set below —",
+                          "Why": (g or {}).get("reason", "")} for i, g in guesses]
+                st.dataframe(pd.DataFrame(shown), hide_index=True, width="stretch")
             rel = {"— None —": None, **{a["name"]: int(a["id"]) for a in accounts}}
-            related_id = rel[c2.selectbox("From account", list(rel), key="dep_related")]
+            related_id = rel[c2.selectbox("From account (overrides the match above)", list(rel), key="dep_related")]
         note = st.text_input("Note (optional)", key="dep_note", placeholder="e.g. cash sales week of Apr 14")
         if st.button(f"Classify {len(chosen_ids)} deposit(s) as {treatment}", type="primary",
                      disabled=not chosen_ids, width="stretch"):
@@ -1340,7 +1354,8 @@ elif page == "Deposits":
                     done = db.classify_deposits(
                         connection, business_id=business_id, transaction_ids=chosen_ids,
                         treatment=treatment, counterparty=counterparty, category_id=category_id,
-                        related_account_id=related_id, notes=note)
+                        related_account_id=related_id, notes=note,
+                        fill_transfer_from_records=fill_from_records)
                 st.session_state["dep_message"] = f"Classified {done} deposit(s) as {treatment}."
                 rerun()
     if st.session_state.get("dep_message"):
@@ -1396,8 +1411,19 @@ elif page == "Review Queue":
             help="Selecting a category automatically selects its default revenue or expense treatment.")
         treatment = st.selectbox("Accounting treatment", list(db.TREATMENTS[:-1]), key=treatment_key)
         related_options = {"— None —": None, **{item["name"]: int(item["id"]) for item in accounts}}
-        related_name = st.selectbox("Related account", list(related_options), key=f"review_related_{row['id']}",
+        related_key = f"review_related_{row['id']}"
+        transfer_guess = None
+        if treatment == "Transfer":
+            with db.connect(DB_PATH) as connection:
+                transfer_guess = db.suggest_transfer_counterpart(connection, business_id, int(row["id"]))
+            if (transfer_guess and transfer_guess["related_account_name"] in related_options
+                    and st.session_state.get(related_key, "— None —") == "— None —"
+                    ):
+                st.session_state[related_key] = transfer_guess["related_account_name"]
+        related_name = st.selectbox("Related account", list(related_options), key=related_key,
                                      help="Use for transfers, loan draws, principal repayments, and loans receivable.")
+        if transfer_guess:
+            st.caption(f"Pre-filled from your records: {transfer_guess['reason']}.")
         suggested_pattern = db.suggested_vendor_pattern(row["description"])
         pattern = st.text_input("Description contains (partial match)", value=suggested_pattern,
                                 key=f"review_pattern_{row['id']}",

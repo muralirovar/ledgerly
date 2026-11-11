@@ -515,5 +515,38 @@ class BooksTests(unittest.TestCase):
                                      treatment="Expense")
 
 
+    def test_transfer_prefill_and_deposits_in_statement_log(self):
+        with db.connect(self.path) as connection:
+            other = db.get_or_create_account(connection, self.business, "Savings", "savings")
+            db.insert_transaction(
+                connection, business_id=self.business, account_id=other, transaction_date="2026-04-18",
+                posting_date=None, description="Check #158", source_amount=-9000, signed_amount=-9000)
+            dep, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account, transaction_date="2026-04-20",
+                posting_date=None, description="ATM DEPOSIT", source_amount=9000, signed_amount=9000)
+            guess = db.suggest_transfer_counterpart(connection, self.business, dep)
+            self.assertEqual(guess["related_account_id"], other)
+            self.assertIn("Matching", guess["reason"])
+            db.classify_deposits(connection, business_id=self.business, transaction_ids=[dep],
+                                 treatment="Transfer", fill_transfer_from_records=True)
+            row = connection.execute("SELECT related_account_id, counterparty FROM transactions WHERE id=?", (dep,)).fetchone()
+            self.assertEqual((row["related_account_id"], row["counterparty"]), (other, "Savings"))
+            later, _, _ = db.insert_transaction(
+                connection, business_id=self.business, account_id=self.account, transaction_date="2026-08-02",
+                posting_date=None, description="ATM DEPOSIT", source_amount=700, signed_amount=700)
+            self.assertEqual(db.suggest_transfer_counterpart(connection, self.business, later)["related_account_id"], other)
+            db.confirm_deposit_checks(
+                connection, business_id=self.business, account_id=self.account, transaction_id=later,
+                bank_name="Bank", account_last4="1234",
+                deposited_checks=[{"check_number": "55", "payer": "Acme", "amount": 700}],
+                category_id=None, treatment="Revenue")
+            log = db.list_statement_log(connection, self.business)
+            self.assertEqual(len(log), 1)
+            self.assertEqual((log[0]["deposits_reconciled"], log[0]["deposit_total"], log[0]["status"]),
+                             (1, 700.0, "Deposits only"))
+            rows = db.statement_log_rows(connection, self.business)
+            self.assertEqual([(r["direction"], r["check_number"], r["amount"]) for r in rows], [("deposit", "55", 700.0)])
+
+
 if __name__ == "__main__":
     unittest.main()

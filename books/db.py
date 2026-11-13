@@ -304,6 +304,15 @@ CREATE TABLE IF NOT EXISTS check_register (
 CREATE INDEX IF NOT EXISTS idx_check_register_business_date
 ON check_register(business_id, cleared_date);
 
+CREATE TABLE IF NOT EXISTS margin_links (
+    id INTEGER PRIMARY KEY,
+    business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    revenue_party TEXT NOT NULL,
+    expense_party TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(business_id, expense_party)
+);
+
 CREATE TABLE IF NOT EXISTS statement_log (
     id INTEGER PRIMARY KEY,
     business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
@@ -912,6 +921,52 @@ def set_rule_active(connection: sqlite3.Connection, rule_id: int, active: bool) 
     )
 
 
+def update_rule(
+    connection: sqlite3.Connection, rule_id: int, *, pattern: str, category_id: int | None, treatment: str,
+    related_account_id: int | None = None, priority: int = 100, active: bool = True, apply_existing: bool = False,
+) -> int:
+    """Edit a learned rule. Returns how many waiting transactions it classified."""
+    pattern = normalize_description(pattern)
+    if not pattern:
+        raise ValueError("A matching phrase is required.")
+    rule = connection.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    if rule is None:
+        raise ValueError("That rule no longer exists.")
+    clash = connection.execute(
+        "SELECT id FROM rules WHERE business_id = ? AND account_id IS ? AND pattern = ? AND id <> ?",
+        (rule["business_id"], rule["account_id"], pattern, rule_id)).fetchone()
+    if clash:
+        raise ValueError("Another rule already uses that phrase for this account.")
+    now = utc_now()
+    connection.execute(
+        """UPDATE rules SET pattern = ?, category_id = ?, treatment = ?, related_account_id = ?, priority = ?,
+                  active = ?, updated_at = ? WHERE id = ?""",
+        (pattern, category_id, treatment, related_account_id, int(priority), 1 if active else 0, now, rule_id))
+    applied = 0
+    if apply_existing and active:
+        params: list[Any] = [category_id, treatment, related_account_id, rule_id, now, now, rule["business_id"]]
+        account_filter = ""
+        if rule["account_id"] is not None:
+            account_filter = " AND account_id = ?"
+            params.append(rule["account_id"])
+        params.append(f"%{pattern}%")
+        applied = connection.execute(
+            f"""UPDATE transactions SET category_id = ?, treatment = ?, related_account_id = ?,
+                    learned_rule_id = ?, status = 'auto_classified', reviewed_at = ?, updated_at = ?
+                WHERE business_id = ? {account_filter} AND status = 'needs_review'
+                  AND normalized_description LIKE ?""", params).rowcount
+        if applied:
+            connection.execute("UPDATE rules SET hit_count = hit_count + ? WHERE id = ?", (applied, rule_id))
+    return applied
+
+
+def delete_rule(connection: sqlite3.Connection, rule_id: int) -> None:
+    """Delete a learned rule; transactions it classified keep their classification."""
+    connection.execute("UPDATE transactions SET learned_rule_id = NULL WHERE learned_rule_id = ?", (rule_id,))
+    connection.execute("UPDATE vendors SET rule_id = NULL WHERE rule_id = ?", (rule_id,))
+    connection.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+
+
 def get_transaction(connection: sqlite3.Connection, transaction_id: int) -> dict[str, Any] | None:
     return _dict(
         connection.execute(
@@ -1471,6 +1526,226 @@ def list_parties(connection: sqlite3.Connection, business_id: int) -> list[dict[
     return sorted(result, key=lambda r: r["party"].lower())
 
 
+def _date_clause(column: str, start: str | None, end: str | None) -> tuple[str, list[Any]]:
+    clause, params = "", []
+    if start:
+        clause += f" AND {column} >= ?"; params.append(start)
+    if end:
+        clause += f" AND {column} <= ?"; params.append(end)
+    return clause, params
+
+
+def _party_display(connection: sqlite3.Connection, business_id: int) -> dict[str, str]:
+    return {_payee_key(p["party"]): p["party"] for p in list_parties(connection, business_id)}
+
+
+NO_PARTY = "(No party recorded)"
+
+
+def loan_ledger(
+    connection: sqlite3.Connection, business_id: int, start: str | None = None, end: str | None = None,
+) -> list[dict[str, Any]]:
+    """Every loan movement: bank transactions plus register checks not tied to a bank transaction."""
+    names = _party_display(connection, business_id)
+    marks = ",".join("?" for _ in LOAN_TREATMENTS)
+    rows: list[dict[str, Any]] = []
+    clause, extra = _date_clause("t.transaction_date", start, end)
+    for r in connection.execute(
+        f"""SELECT t.id, t.transaction_date AS date, a.name AS account, t.description, t.signed_amount,
+                   t.treatment, t.counterparty
+            FROM transactions t JOIN accounts a ON a.id = t.account_id
+            WHERE t.business_id = ? AND t.treatment IN ({marks}){clause}""",
+        [business_id, *LOAN_TREATMENTS, *extra]):
+        party = (r["counterparty"] or "").strip()
+        rows.append({"date": r["date"], "party": names.get(_payee_key(party), party) if party else NO_PARTY,
+                     "role": LOAN_ROLES[r["treatment"]], "treatment": r["treatment"],
+                     "amount": abs(float(r["signed_amount"])), "account": r["account"],
+                     "description": r["description"], "source": "Bank transaction"})
+    clause, extra = _date_clause("r.cleared_date", start, end)
+    for r in connection.execute(
+        f"""SELECT r.cleared_date AS date, a.name AS account, r.check_number, r.amount, r.treatment, r.payee, r.memo
+            FROM check_register r JOIN accounts a ON a.id = r.account_id
+            WHERE r.business_id = ? AND r.transaction_id IS NULL AND r.treatment IN ({marks}){clause}""",
+        [business_id, *LOAN_TREATMENTS, *extra]):
+        party = (r["payee"] or "").strip()
+        rows.append({"date": r["date"], "party": names.get(_payee_key(party), party) if party else NO_PARTY,
+                     "role": LOAN_ROLES[r["treatment"]], "treatment": r["treatment"],
+                     "amount": float(r["amount"]), "account": r["account"],
+                     "description": f"Check #{r['check_number']} {r['memo'] or ''}".strip(), "source": "Check register"})
+    return sorted(rows, key=lambda x: (x["date"], x["party"]), reverse=True)
+
+
+def loan_report(
+    connection: sqlite3.Connection, business_id: int, start: str | None = None, end: str | None = None,
+) -> list[dict[str, Any]]:
+    """Loan position by party: what they owe the business and what the business owes them."""
+    by_party: dict[str, dict[str, float]] = {}
+    for row in loan_ledger(connection, business_id, start, end):
+        item = by_party.setdefault(row["party"], {"Loan receivable": 0.0, "Receivable repayment": 0.0,
+                                                  "Loan draw": 0.0, "Principal repayment": 0.0})
+        item[row["treatment"]] += row["amount"]
+    report = []
+    for party, v in by_party.items():
+        report.append({
+            "party": party, "lent": round(v["Loan receivable"], 2), "repaid_to_us": round(v["Receivable repayment"], 2),
+            "owed_to_us": round(v["Loan receivable"] - v["Receivable repayment"], 2),
+            "borrowed": round(v["Loan draw"], 2), "repaid_by_us": round(v["Principal repayment"], 2),
+            "we_owe": round(v["Loan draw"] - v["Principal repayment"], 2)})
+    return sorted(report, key=lambda r: -(abs(r["owed_to_us"]) + abs(r["we_owe"])))
+
+
+EXCLUDED_REASONS = {
+    "Transfer": "Internal transfer", "Loan draw": "Loan received", "Principal repayment": "Loan repaid",
+    "Loan receivable": "Loan made", "Receivable repayment": "Loan repayment received",
+    "Owner contribution": "Owner contribution", "Excluded": "Marked excluded",
+}
+
+
+def excluded_from_pnl(
+    connection: sqlite3.Connection, business_id: int, start: str | None = None, end: str | None = None,
+    include_unreviewed: bool = False,
+) -> list[dict[str, Any]]:
+    """Transactions that stay outside profit and loss, with the reason."""
+    treatments = list(EXCLUDED_REASONS)
+    marks = ",".join("?" for _ in treatments)
+    clause, extra = _date_clause("t.transaction_date", start, end)
+    condition = f"t.treatment IN ({marks})"
+    params: list[Any] = [business_id, *treatments]
+    if include_unreviewed:
+        condition = f"({condition} OR t.status = 'needs_review')"
+    rows = []
+    for r in connection.execute(
+        f"""SELECT t.id, t.transaction_date AS date, a.name AS account, t.description, t.signed_amount,
+                   t.treatment, t.status, t.counterparty, c.name AS category, t.notes
+            FROM transactions t JOIN accounts a ON a.id = t.account_id
+            LEFT JOIN categories c ON c.id = t.category_id
+            WHERE t.business_id = ? AND {condition}{clause}
+            ORDER BY t.transaction_date DESC, t.id DESC""", [*params, *extra]):
+        item = dict(r)
+        item["reason"] = ("Not yet classified" if item["status"] == "needs_review"
+                          else EXCLUDED_REASONS.get(item["treatment"], item["treatment"]))
+        rows.append(item)
+    return rows
+
+
+def vendor_report(
+    connection: sqlite3.Connection, business_id: int, start: str | None = None, end: str | None = None,
+) -> list[dict[str, Any]]:
+    """Revenue and expense by vendor or party.
+
+    The party is the counterparty on the transaction, else the vendor mapping that matches its bank
+    description, else the short vendor text taken from the description.
+    """
+    mappings = [(normalize_description(v["match_pattern"]), v["name"]) for v in connection.execute(
+        "SELECT name, match_pattern FROM vendors WHERE business_id = ? AND active = 1", (business_id,))]
+    mappings.sort(key=lambda m: -len(m[0]))
+    names = _party_display(connection, business_id)
+    clause, extra = _date_clause("t.transaction_date", start, end)
+    totals: dict[str, dict[str, Any]] = {}
+    for r in connection.execute(
+        f"""SELECT t.description, t.normalized_description, t.counterparty, t.signed_amount, t.treatment, t.transaction_date
+            FROM transactions t WHERE t.business_id = ?
+              AND t.treatment IN ('Revenue','Revenue refund','Expense','Expense refund'){clause}""",
+        [business_id, *extra]):
+        party = (r["counterparty"] or "").strip()
+        if party:
+            party = names.get(_payee_key(party), party)
+        else:
+            text = r["normalized_description"] or normalize_description(r["description"])
+            party = next((name for pattern, name in mappings if pattern and pattern in text), "")
+            if not party:
+                words = suggested_vendor_pattern(r["description"]).split()
+                while len(words) > 1 and re.fullmatch(r"[#*]?\d[\w-]*", words[-1]):
+                    words.pop()  # reference numbers should not split one vendor into many
+                party = " ".join(words).title() or "(Unknown)"
+        item = totals.setdefault(party, {"revenue": 0.0, "expense": 0.0, "transactions": 0, "last": ""})
+        amount = float(r["signed_amount"])
+        if r["treatment"] in ("Revenue", "Revenue refund"):
+            item["revenue"] += amount
+        elif r["treatment"] == "Expense":
+            item["expense"] += abs(amount)
+        else:
+            item["expense"] -= abs(amount)
+        item["transactions"] += 1
+        item["last"] = max(item["last"], r["transaction_date"])
+    result = [{"party": p, "revenue": round(v["revenue"], 2), "expense": round(v["expense"], 2),
+               "net": round(v["revenue"] - v["expense"], 2), "transactions": v["transactions"],
+               "last_activity": v["last"]} for p, v in totals.items()]
+    return sorted(result, key=lambda x: -(abs(x["revenue"]) + abs(x["expense"])))
+
+
+def list_margin_links(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
+    return [dict(r) for r in connection.execute(
+        """SELECT id, revenue_party, expense_party FROM margin_links WHERE business_id = ?
+           ORDER BY LOWER(revenue_party), LOWER(expense_party)""", (business_id,))]
+
+
+def set_margin_links(
+    connection: sqlite3.Connection, *, business_id: int, revenue_party: str, expense_parties: list[str],
+) -> int:
+    """Tie expense companies to the revenue company they serve. An expense company maps to one customer."""
+    revenue_party = " ".join((revenue_party or "").split())
+    if not revenue_party:
+        raise ValueError("Choose the revenue company.")
+    names = [" ".join(n.split()) for n in dict.fromkeys(expense_parties) if n and n.strip()]
+    if not names:
+        raise ValueError("Choose at least one expense company.")
+    if any(_payee_key(n) == _payee_key(revenue_party) for n in names):
+        raise ValueError("A company cannot be mapped to itself.")
+    now = utc_now()
+    for name in names:
+        connection.execute(
+            """INSERT INTO margin_links(business_id, revenue_party, expense_party, created_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT(business_id, expense_party) DO UPDATE SET revenue_party = excluded.revenue_party""",
+            (business_id, revenue_party, name, now))
+    return len(names)
+
+
+def delete_margin_links(connection: sqlite3.Connection, business_id: int, link_ids: list[int]) -> int:
+    count = 0
+    for link_id in link_ids:
+        count += connection.execute(
+            "DELETE FROM margin_links WHERE id = ? AND business_id = ?", (int(link_id), business_id)).rowcount
+    return count
+
+
+def margin_report(
+    connection: sqlite3.Connection, business_id: int, start: str | None = None, end: str | None = None,
+) -> dict[str, Any]:
+    """Margin per revenue company: its revenue less the expense of the companies mapped to it."""
+    vendors = vendor_report(connection, business_id, start, end)
+    by_key = {_payee_key(v["party"]): v for v in vendors}
+    links = list_margin_links(connection, business_id)
+    linked: dict[str, list[str]] = {}
+    mapped_keys: set[str] = set()
+    for link in links:
+        linked.setdefault(link["revenue_party"], []).append(link["expense_party"])
+        mapped_keys.add(_payee_key(link["expense_party"]))
+    customers: dict[str, dict[str, Any]] = {}
+    for v in vendors:
+        if v["revenue"] != 0:
+            customers[_payee_key(v["party"])] = {"customer": v["party"], "revenue": v["revenue"]}
+    for revenue_party in linked:
+        customers.setdefault(_payee_key(revenue_party), {"customer": revenue_party, "revenue": 0.0})
+    link_keys = {_payee_key(k): k for k in linked}
+    rows, details = [], {}
+    for key, c in customers.items():
+        expense_parties = linked.get(link_keys.get(key, ""), [])
+        breakdown = [{"expense_party": n, "expense": round(by_key.get(_payee_key(n), {}).get("expense", 0.0), 2)}
+                     for n in expense_parties]
+        expense = round(sum(b["expense"] for b in breakdown), 2)
+        revenue = round(c["revenue"], 2)
+        margin = round(revenue - expense, 2)
+        rows.append({"customer": c["customer"], "revenue": revenue, "mapped_expense": expense, "margin": margin,
+                     "margin_pct": round(margin / revenue * 100, 1) if revenue else None,
+                     "expense_companies": ", ".join(expense_parties), "mapped": bool(expense_parties)})
+        details[c["customer"]] = breakdown
+    rows.sort(key=lambda r: -abs(r["revenue"]))
+    unmapped = [{"party": v["party"], "expense": v["expense"], "transactions": v["transactions"]}
+                for v in vendors if v["expense"] > 0 and _payee_key(v["party"]) not in mapped_keys]
+    return {"customers": rows, "details": details, "unmapped_expenses": unmapped}
+
+
 def rename_party(
     connection: sqlite3.Connection, *, business_id: int, old_names: list[str], new_name: str,
 ) -> dict[str, int]:
@@ -1493,6 +1768,12 @@ def rename_party(
         connection.execute(
             """UPDATE statement_log_checks SET payee = ? WHERE payee = ? AND log_id IN
                (SELECT id FROM statement_log WHERE business_id = ?)""", (new_name, old, business_id))
+        connection.execute("UPDATE vendors SET name = ?, updated_at = ? WHERE business_id = ? AND name = ?",
+                           (new_name, now, business_id, old))
+        connection.execute("UPDATE margin_links SET revenue_party = ? WHERE business_id = ? AND revenue_party = ?",
+                           (new_name, business_id, old))
+        connection.execute("UPDATE OR REPLACE margin_links SET expense_party = ? WHERE business_id = ? AND expense_party = ?",
+                           (new_name, business_id, old))
     return counts
 
 

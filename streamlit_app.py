@@ -172,6 +172,65 @@ def section_label(text: str) -> None:
     st.markdown(f'<div class="section-kicker">{escape(text)}</div>', unsafe_allow_html=True)
 
 
+def period_picker(prefix: str, container=None) -> tuple[str | None, str | None]:
+    """Year / all-time / custom range chooser; returns ISO start and end (or None for open ends)."""
+    host = container or st
+    this_year = date.today().year
+    choice = host.selectbox("Period", ["All time", *[str(y) for y in range(this_year, this_year - 6, -1)], "Custom range"],
+                            key=f"{prefix}_period")
+    if choice == "All time":
+        return None, None
+    if choice == "Custom range":
+        picked = host.date_input("Dates", value=(date(this_year, 1, 1), date.today()), key=f"{prefix}_dates")
+        if isinstance(picked, (tuple, list)) and len(picked) == 2:
+            return picked[0].isoformat(), picked[1].isoformat()
+        return None, None
+    return f"{choice}-01-01", f"{choice}-12-31"
+
+
+def csv_download(label: str, frame: pd.DataFrame, file_stem: str, key: str) -> None:
+    st.download_button(label, data=frame.to_csv(index=False).encode("utf-8"),
+                       file_name=f"{db.slugify(business_name)}-{file_stem}.csv", mime="text/csv", key=key)
+
+
+def render_loan_balances(loan_rows: list[dict], show_business: bool = False) -> None:
+    """Two plain lists: who owes the business money, and who the business owes."""
+    owed_to_us = sorted((r for r in loan_rows if r["owed_to_us"] > 0.004), key=lambda r: -r["owed_to_us"])
+    we_owe = sorted((r for r in loan_rows if r["we_owe"] > 0.004), key=lambda r: -r["we_owe"])
+    odd = [r for r in loan_rows if r["owed_to_us"] < -0.004 or r["we_owe"] < -0.004]
+    c1, c2 = st.columns(2)
+    with c1:
+        metric_card("Owed to us", money(sum(r["owed_to_us"] for r in owed_to_us)), "Money others still owe us", "↗", "teal")
+        st.markdown("**Who owes us**")
+        if owed_to_us:
+            frame = pd.DataFrame([{**({"Business": r["business"]} if show_business else {}),
+                                   "Party": r["party"], "Amount": r["owed_to_us"]} for r in owed_to_us])
+            st.dataframe(frame, hide_index=True, width="stretch",
+                         column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+        else:
+            st.caption("Nobody owes us anything.")
+    with c2:
+        metric_card("We owe", money(sum(r["we_owe"] for r in we_owe)), "Money we still owe others", "↘", "rose")
+        st.markdown("**Whom we owe**")
+        if we_owe:
+            frame = pd.DataFrame([{**({"Business": r["business"]} if show_business else {}),
+                                   "Party": r["party"], "Amount": r["we_owe"]} for r in we_owe])
+            st.dataframe(frame, hide_index=True, width="stretch",
+                         column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+        else:
+            st.caption("We owe nobody anything.")
+    if odd:
+        with st.expander(f"{len(odd)} part(s) need a look: repayments larger than the loan on record"):
+            st.caption("Usually a loan that was never recorded, or a payment that is not really a loan repayment.")
+            st.dataframe(pd.DataFrame([{
+                **({"Business": r["business"]} if show_business else {}), "Party": r["party"],
+                "Problem": ("Repayments to us exceed loans made" if r["owed_to_us"] < -0.004
+                            else "We repaid more than we borrowed"),
+                "Excess": abs(min(r["owed_to_us"], r["we_owe"]))} for r in odd]),
+                hide_index=True, width="stretch",
+                column_config={"Excess": st.column_config.NumberColumn(format="$%.2f")})
+
+
 def go_to(label: str) -> None:
     st.session_state["nav_choice"] = label
 
@@ -398,7 +457,7 @@ nav = {
     "⇧  Import transactions": "Import / Paste",
     "▤  Statements & checks": "Statements & Checks",
     "＄  Deposits": "Deposits", "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
-    "☷  Parties": "Parties", "⌂  Vendors": "Vendors", "⌁  Categories & rules": "Categories & Rules",
+    "▥  Reports": "Reports", "☷  Parties": "Parties", "⌁  Categories & rules": "Categories & Rules",
     "◇  Accounts & credit": "Accounts & Credit",
     "⚙  Manage business": "Manage Business", "↓  Export & settings": "Export & Settings",
     "🛡  Admin & backup": "Admin & Backup",
@@ -517,6 +576,92 @@ def delete_backup_dialog(name: str) -> None:
         st.rerun()
 
 
+def render_bank_text_rules() -> None:
+    """Bank-text rules: a short phrase in the bank description sets the party, category and treatment."""
+    st.caption("When a bank description contains the phrase, the transaction is filed under this party with the category and "
+               "treatment below. Names here are parties, so they match the Parties list.")
+    with db.connect(DB_PATH) as connection:
+        categories = db.list_categories(connection, business_id)
+        vendors = db.list_vendors(connection, business_id, include_inactive=True)
+    if not categories:
+        st.warning("Create at least one category before adding a rule.")
+        return
+    category_by_name = {item["name"]: item for item in categories}
+    category_defaults = {item["name"]: item["default_treatment"] for item in categories}
+    left, right = st.columns(2, gap="large")
+    with left:
+        section_label("Add a rule")
+        new_vendor_name = st.text_input("Party (vendor / customer) name", key="new_vendor_name")
+        new_vendor_pattern = st.text_input("Description contains", key="new_vendor_pattern",
+                                           placeholder="MULTIVISIONOPERA")
+        new_vendor_category_key = "new_vendor_category"
+        new_vendor_treatment_key = "new_vendor_treatment"
+        if new_vendor_treatment_key not in st.session_state:
+            st.session_state[new_vendor_treatment_key] = categories[0]["default_treatment"]
+        new_vendor_category = st.selectbox(
+            "Category", list(category_by_name), key=new_vendor_category_key,
+            on_change=sync_category_treatment,
+            args=(new_vendor_category_key, new_vendor_treatment_key, category_defaults))
+        new_vendor_treatment = st.selectbox("Treatment", list(db.TREATMENTS[:-1]), key=new_vendor_treatment_key)
+        new_vendor_apply = st.checkbox("Classify matching transactions already waiting", value=True,
+                                       key="new_vendor_apply")
+        if st.button("Add rule", type="primary", width="stretch"):
+            try:
+                with db.connect(DB_PATH) as connection:
+                    _, applied = db.upsert_vendor(
+                        connection, business_id=business_id, name=new_vendor_name,
+                        match_pattern=new_vendor_pattern,
+                        category_id=int(category_by_name[new_vendor_category]["id"]),
+                        treatment=new_vendor_treatment, apply_existing=new_vendor_apply)
+                st.success(f"Rule saved. {applied} waiting transaction(s) were classified.")
+                rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    with right:
+        section_label("Manage a rule")
+        if not vendors:
+            st.info("No rules yet. Save one during Review or add it here.")
+        else:
+            vendor_by_label = {
+                f"{item['name']} · contains {item['match_pattern']}{' · inactive' if not item['active'] else ''}": item
+                for item in vendors
+            }
+            vendor_label = st.selectbox("Rule", list(vendor_by_label))
+            vendor = vendor_by_label[vendor_label]
+            with st.form("manage_vendor"):
+                edit_vendor_name = st.text_input("Name", value=vendor["name"])
+                edit_vendor_pattern = st.text_input("Description contains", value=vendor["match_pattern"])
+                edit_category_names = list(category_by_name)
+                edit_category_index = edit_category_names.index(vendor["category_name"]) if vendor["category_name"] in edit_category_names else 0
+                edit_vendor_category = st.selectbox("Category", edit_category_names, index=edit_category_index)
+                treatment_options = list(db.TREATMENTS[:-1])
+                edit_treatment_index = treatment_options.index(vendor["treatment"]) if vendor["treatment"] in treatment_options else 0
+                edit_vendor_treatment = st.selectbox("Treatment", treatment_options, index=edit_treatment_index)
+                edit_vendor_active = st.checkbox("Active", value=bool(vendor["active"]))
+                edit_vendor_apply = st.checkbox("Apply updated mapping to waiting transactions", value=True)
+                if st.form_submit_button("Save rule changes", width="stretch"):
+                    try:
+                        with db.connect(DB_PATH) as connection:
+                            _, applied = db.upsert_vendor(
+                                connection, business_id=business_id, vendor_id=int(vendor["id"]),
+                                name=edit_vendor_name, match_pattern=edit_vendor_pattern,
+                                category_id=int(category_by_name[edit_vendor_category]["id"]),
+                                treatment=edit_vendor_treatment, active=edit_vendor_active,
+                                apply_existing=edit_vendor_apply)
+                        st.success(f"Rule updated. {applied} waiting transaction(s) were classified.")
+                        rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+    section_label("All rules")
+    if vendors:
+        vendor_frame = pd.DataFrame(vendors).rename(columns={
+            "name": "Party", "match_pattern": "Description contains",
+            "category_name": "Category", "treatment": "Treatment", "hit_count": "Rule matches",
+            "active": "Active"})
+        st.dataframe(vendor_frame[["Party", "Description contains", "Category", "Treatment", "Rule matches", "Active"]],
+                     hide_index=True, width="stretch")
+
+
 if page == "Admin & Backup":
     render_admin()
     st.stop()
@@ -596,6 +741,48 @@ if page == "Dashboard":
                      column_config={key: st.column_config.NumberColumn(format="$%.2f") for key in ["Revenue", "Expense", "Net", "LOC balance"]})
     if total_loc:
         st.caption(f"Outstanding line-of-credit principal across this view: {money(total_loc)}")
+
+    dash_ids = [int(b["id"]) for b in businesses] if all_businesses else [business_id]
+    business_name_by_id = {int(b["id"]): b["name"] for b in businesses}
+    dash_loans, dash_vendors = [], []
+    with db.connect(DB_PATH) as connection:
+        for dash_id in dash_ids:
+            for row in db.loan_report(connection, dash_id):
+                dash_loans.append({"business": business_name_by_id[dash_id], **row})
+            for row in db.vendor_report(connection, dash_id):
+                dash_vendors.append({"Business": business_name_by_id[dash_id], **row})
+    section_label("Loans")
+    if dash_loans:
+        render_loan_balances(dash_loans, show_business=all_businesses)
+        st.button("▥  Open loan reports", on_click=go_to, args=("▥  Reports",), key="dash_to_loans")
+    else:
+        st.caption("No loan activity recorded yet.")
+    section_label("Revenue and expense by vendor")
+    if dash_vendors:
+        vendor_dash = pd.DataFrame(dash_vendors).rename(columns={
+            "party": "Vendor / party", "revenue": "Revenue", "expense": "Expense", "net": "Net",
+            "transactions": "Transactions", "last_activity": "Last activity"})
+        if all_businesses:
+            vendor_dash = vendor_dash.groupby("Vendor / party", as_index=False).agg(
+                Revenue=("Revenue", "sum"), Expense=("Expense", "sum"), Net=("Net", "sum"),
+                Transactions=("Transactions", "sum"), **{"Last activity": ("Last activity", "max")})
+        else:
+            vendor_dash = vendor_dash.drop(columns=["Business"])
+        top_n = st.slider("Vendors to show", 5, 25, 10, key="dash_vendor_count")
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Top revenue sources**")
+            top_rev = vendor_dash[vendor_dash["Revenue"] > 0].sort_values("Revenue", ascending=False).head(top_n)
+            st.dataframe(top_rev[["Vendor / party", "Revenue", "Transactions"]], hide_index=True, width="stretch",
+                         column_config={"Revenue": st.column_config.NumberColumn(format="$%.2f")})
+        with right:
+            st.markdown("**Top expenses**")
+            top_exp = vendor_dash[vendor_dash["Expense"] > 0].sort_values("Expense", ascending=False).head(top_n)
+            st.dataframe(top_exp[["Vendor / party", "Expense", "Transactions"]], hide_index=True, width="stretch",
+                         column_config={"Expense": st.column_config.NumberColumn(format="$%.2f")})
+        st.button("▥  Open vendor report", on_click=go_to, args=("▥  Reports",), key="dash_to_vendor")
+    else:
+        st.caption("No revenue or expense recorded yet.")
 
 
 elif page == "Revenue & Expense":
@@ -1880,12 +2067,221 @@ elif page == "Transactions":
                 rerun()
 
 
+elif page == "Reports":
+    page_header("Loans, exclusions and vendor reports",
+                "Loan positions by party, everything kept out of profit and loss, and revenue and expense by vendor or party.",
+                "Reports")
+    r_start, r_end = period_picker("reports")
+    tab_loans, tab_excluded, tab_vendor, tab_margin = st.tabs(["Loans", "Excluded from P&L", "By vendor / party", "Margin"])
+    with db.connect(DB_PATH) as connection:
+        loan_rows = db.loan_report(connection, business_id, r_start, r_end)
+        loan_ledger_rows = db.loan_ledger(connection, business_id, r_start, r_end)
+        vendor_rows = db.vendor_report(connection, business_id, r_start, r_end)
+
+    with tab_loans:
+        render_loan_balances(loan_rows)
+        if not loan_rows:
+            st.info("No loan activity in this period.")
+        else:
+            def _status(open_amount: float) -> str:
+                return "Settled" if abs(open_amount) < 0.005 else ("Check: repaid more than lent" if open_amount < 0 else "Open")
+            usd = st.column_config.NumberColumn(format="$%.2f")
+            lent_rows = [r for r in loan_rows if r["lent"] or r["repaid_to_us"]]
+            borrowed_rows = [r for r in loan_rows if r["borrowed"] or r["repaid_by_us"]]
+            section_label("Money we lent: lent to whom, repaid by whom")
+            if lent_rows:
+                lent_frame = pd.DataFrame([{
+                    "Lent to": r["party"], "We lent": r["lent"], "Repaid to us by them": r["repaid_to_us"],
+                    "Still owes us": r["owed_to_us"], "Status": _status(r["owed_to_us"])} for r in lent_rows])
+                st.dataframe(lent_frame, hide_index=True, width="stretch",
+                             column_config={c: usd for c in ("We lent", "Repaid to us by them", "Still owes us")})
+                csv_download("Download money we lent (CSV)", lent_frame, "loans-we-lent", "dl_loans_lent")
+            else:
+                st.caption("We lent no money in this period.")
+            section_label("Money we borrowed: borrowed from whom, repaid to whom")
+            if borrowed_rows:
+                borrowed_frame = pd.DataFrame([{
+                    "Borrowed from": r["party"], "We borrowed": r["borrowed"], "We repaid them": r["repaid_by_us"],
+                    "We still owe": r["we_owe"], "Status": _status(r["we_owe"])} for r in borrowed_rows])
+                st.dataframe(borrowed_frame, hide_index=True, width="stretch",
+                             column_config={c: usd for c in ("We borrowed", "We repaid them", "We still owe")})
+                csv_download("Download money we borrowed (CSV)", borrowed_frame, "loans-we-borrowed", "dl_loans_borrowed")
+            else:
+                st.caption("We borrowed no money in this period.")
+            st.caption("\"Check\" means repayments are larger than the loan on record: usually a loan that was never recorded, "
+                       "or a payment that is not really a loan repayment.")
+            section_label("Loan transactions")
+            ledger_frame = pd.DataFrame(loan_ledger_rows).rename(columns={
+                "date": "Date", "party": "Party", "role": "Role", "treatment": "Treatment", "amount": "Amount",
+                "account": "Account", "description": "Description", "source": "Source"})
+            party_pick = st.selectbox("Party", ["All parties"] + sorted(ledger_frame["Party"].unique()), key="loan_party_filter")
+            if party_pick != "All parties":
+                ledger_frame = ledger_frame[ledger_frame["Party"] == party_pick]
+            st.dataframe(ledger_frame, hide_index=True, width="stretch",
+                         column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            csv_download("Download loan transactions (CSV)", ledger_frame, "loan-transactions", "dl_loan_ledger")
+
+    with tab_excluded:
+        include_unreviewed = st.checkbox("Also list transactions not yet classified", key="excluded_unreviewed")
+        with db.connect(DB_PATH) as connection:
+            excluded_rows = db.excluded_from_pnl(connection, business_id, r_start, r_end, include_unreviewed)
+        if not excluded_rows:
+            st.info("Nothing is excluded in this period.")
+        else:
+            excluded_frame = pd.DataFrame(excluded_rows)
+            by_reason = excluded_frame.groupby("reason", as_index=False).agg(
+                Transactions=("id", "count"), Money_in=("signed_amount", lambda x: x[x > 0].sum()),
+                Money_out=("signed_amount", lambda x: -x[x < 0].sum())).rename(
+                columns={"reason": "Reason", "Money_in": "Money in", "Money_out": "Money out"})
+            section_label("Excluded by reason")
+            st.dataframe(by_reason, hide_index=True, width="stretch", column_config={
+                "Money in": st.column_config.NumberColumn(format="$%.2f"),
+                "Money out": st.column_config.NumberColumn(format="$%.2f")})
+            reasons = st.multiselect("Reason", sorted(excluded_frame["reason"].unique()), placeholder="All reasons",
+                                     key="excluded_reason_filter")
+            search = st.text_input("Search", key="excluded_search", placeholder="Description, party, account…")
+            detail = excluded_frame.copy()
+            if reasons:
+                detail = detail[detail["reason"].isin(reasons)]
+            if search.strip():
+                hay = detail[["description", "counterparty", "account", "notes"]].fillna("").agg(" ".join, axis=1).str.lower()
+                detail = detail[hay.str.contains(search.strip().lower(), regex=False)]
+            detail = detail.rename(columns={
+                "id": "Transaction #", "date": "Date", "account": "Account", "description": "Description",
+                "signed_amount": "Amount", "treatment": "Treatment", "counterparty": "Party", "category": "Category",
+                "reason": "Reason", "notes": "Notes"})[
+                ["Transaction #", "Date", "Account", "Description", "Amount", "Reason", "Treatment", "Party", "Category", "Notes"]]
+            section_label(f"{len(detail):,} excluded transactions")
+            st.dataframe(detail, hide_index=True, width="stretch",
+                         column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            csv_download("Download excluded list (CSV)", detail, "excluded-from-pnl", "dl_excluded")
+
+    with tab_vendor:
+        if not vendor_rows:
+            st.info("No revenue or expense in this period.")
+        else:
+            v1, v2 = st.columns([2, 1.2])
+            vendor_search = v1.text_input("Search vendor / party", key="vendor_report_search")
+            vendor_view = v2.selectbox("Show", ["All", "Revenue only", "Expense only"], key="vendor_report_view")
+            vendor_frame = pd.DataFrame(vendor_rows).rename(columns={
+                "party": "Vendor / party", "revenue": "Revenue", "expense": "Expense", "net": "Net",
+                "transactions": "Transactions", "last_activity": "Last activity"})
+            if vendor_search.strip():
+                vendor_frame = vendor_frame[vendor_frame["Vendor / party"].str.lower().str.contains(
+                    vendor_search.strip().lower(), regex=False)]
+            if vendor_view == "Revenue only":
+                vendor_frame = vendor_frame[vendor_frame["Revenue"] != 0]
+            elif vendor_view == "Expense only":
+                vendor_frame = vendor_frame[vendor_frame["Expense"] != 0]
+            m1, m2, m3 = st.columns(3)
+            with m1: metric_card("Revenue", money(float(vendor_frame["Revenue"].sum())), "Shown below", "↗", "teal")
+            with m2: metric_card("Expenses", money(float(vendor_frame["Expense"].sum())), "Shown below", "↘", "rose")
+            with m3: metric_card("Net", money(float(vendor_frame["Net"].sum())), "Revenue less expenses", "◆", "navy")
+            st.dataframe(vendor_frame, hide_index=True, width="stretch", column_config={
+                c: st.column_config.NumberColumn(format="$%.2f") for c in ("Revenue", "Expense", "Net")})
+            st.caption("The vendor is the party on the transaction, else the bank-text rule (Parties page) that matches it. "
+                       "Loans, transfers and owner contributions are not included.")
+            csv_download("Download vendor report (CSV)", vendor_frame, "revenue-expense-by-vendor", "dl_vendor_report")
+
+    with tab_margin:
+        with db.connect(DB_PATH) as connection:
+            margin = db.margin_report(connection, business_id, r_start, r_end)
+            links = db.list_margin_links(connection, business_id)
+            all_party_names = [p["party"] for p in db.list_parties(connection, business_id)]
+        customers = margin["customers"]
+        total_rev = sum(c["revenue"] for c in customers)
+        total_exp = sum(c["mapped_expense"] for c in customers)
+        total_margin = total_rev - total_exp
+        k1, k2, k3, k4 = st.columns(4)
+        with k1: metric_card("Revenue", money(total_rev), "From revenue companies", "↗", "teal")
+        with k2: metric_card("Mapped expense", money(total_exp), "Paid to their mapped companies", "↘", "rose")
+        with k3: metric_card("Margin", money(total_margin), "Revenue less mapped expense", "◆", "navy")
+        with k4: metric_card("Margin %", f"{total_margin / total_rev * 100:.1f}%" if total_rev else "—", "Of revenue", "%", "gold")
+
+        section_label("Margin by revenue company")
+        if customers:
+            margin_frame = pd.DataFrame([{
+                "Revenue company": c["customer"], "Revenue": c["revenue"], "Mapped expense": c["mapped_expense"],
+                "Margin": c["margin"], "Margin %": c["margin_pct"],
+                "Expense companies": c["expense_companies"] or "⚠ none mapped yet"} for c in customers])
+            st.dataframe(margin_frame, hide_index=True, width="stretch", column_config={
+                "Revenue": st.column_config.NumberColumn(format="$%.2f"),
+                "Mapped expense": st.column_config.NumberColumn(format="$%.2f"),
+                "Margin": st.column_config.NumberColumn(format="$%.2f"),
+                "Margin %": st.column_config.NumberColumn(format="%.1f%%")})
+            csv_download("Download margin report (CSV)", margin_frame, "margin-by-company", "dl_margin")
+            pick = st.selectbox("See which expense companies make up a margin",
+                                [c["customer"] for c in customers if margin["details"].get(c["customer"])] or ["—"],
+                                key="margin_detail_pick")
+            if margin["details"].get(pick):
+                st.dataframe(pd.DataFrame(margin["details"][pick]).rename(
+                    columns={"expense_party": "Expense company", "expense": "Expense in period"}),
+                    hide_index=True, width="stretch",
+                    column_config={"Expense in period": st.column_config.NumberColumn(format="$%.2f")})
+        else:
+            st.info("No revenue in this period yet.")
+
+        section_label("Map expense companies to a revenue company")
+        st.caption("Each expense company belongs to one revenue company. Choose the revenue company, tick the companies "
+                   "you pay to serve it, and save. Margin is revenue less what you paid those companies.")
+        link_of = {db._payee_key(l["expense_party"]): l["revenue_party"] for l in links}
+        revenue_options = sorted({c["customer"] for c in customers} | {l["revenue_party"] for l in links}
+                                 | {p for p in all_party_names}, key=str.lower)
+        expense_pool = sorted({v["party"] for v in vendor_rows if v["expense"] > 0} | {l["expense_party"] for l in links},
+                              key=lambda n: (db._payee_key(n) in link_of, n.lower()))
+        with st.form("margin_link_form", clear_on_submit=True):
+            revenue_company = st.selectbox("Revenue company", ["— choose —"] + revenue_options, key="margin_revenue_company")
+            expense_companies = st.multiselect(
+                "Expense companies serving it", expense_pool, key="margin_expense_companies",
+                format_func=lambda n: n + (f"  → now mapped to {link_of[db._payee_key(n)]}" if db._payee_key(n) in link_of else ""))
+            if st.form_submit_button("Save mapping", type="primary", width="stretch"):
+                try:
+                    with db.connect(DB_PATH) as connection:
+                        count = db.set_margin_links(
+                            connection, business_id=business_id,
+                            revenue_party="" if revenue_company.startswith("—") else revenue_company,
+                            expense_parties=expense_companies)
+                    st.session_state["margin_message"] = f"Mapped {count} expense company(ies) to {revenue_company}."
+                    rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+        if st.session_state.get("margin_message"):
+            st.success(st.session_state.pop("margin_message"))
+
+        if links:
+            section_label("Current mappings")
+            link_frame = pd.DataFrame(links).rename(columns={"revenue_party": "Revenue company", "expense_party": "Expense company"})
+            link_grid = st.dataframe(link_frame[["Revenue company", "Expense company"]], hide_index=True, width="stretch",
+                                     key=f"margin_link_grid_{len(links)}", on_select="rerun", selection_mode="multi-row")
+            chosen_links = [links[i]["id"] for i in link_grid.selection.rows]
+            if st.button(f"Remove {len(chosen_links)} selected mapping(s)", disabled=not chosen_links, key="margin_remove"):
+                with db.connect(DB_PATH) as connection:
+                    db.delete_margin_links(connection, business_id, chosen_links)
+                rerun()
+        if margin["unmapped_expenses"]:
+            section_label("Expense companies not yet mapped")
+            st.dataframe(pd.DataFrame(margin["unmapped_expenses"]).rename(columns={
+                "party": "Expense company", "expense": "Expense in period", "transactions": "Transactions"}),
+                hide_index=True, width="stretch",
+                column_config={"Expense in period": st.column_config.NumberColumn(format="$%.2f")})
+
+
 elif page == "Parties":
     page_header("Everyone you do business with",
                 "Lenders, borrowers, customers and payees in one list. Rename a party everywhere or merge duplicate spellings.",
                 "Parties")
+    party_view = st.radio("View", ["Parties", "Bank-text rules"], horizontal=True, key="party_view",
+                          label_visibility="collapsed",
+                          help="Bank-text rules were the separate Vendors page: they file transactions under a party automatically.")
+    if party_view == "Bank-text rules":
+        render_bank_text_rules()
+        st.stop()
     with db.connect(DB_PATH) as connection:
         parties = db.list_parties(connection, business_id)
+        rule_keys: dict[str, int] = {}
+        for rule in db.list_vendors(connection, business_id):
+            key = db._payee_key(rule["name"], loose=True)
+            rule_keys[key] = rule_keys.get(key, 0) + 1
     if not parties:
         st.info("No parties yet. Names appear here once you add a counterparty to a transaction or confirm a check.")
         st.stop()
@@ -1907,6 +2303,7 @@ elif page == "Parties":
         "Party": p["party"], "Spellings on record": " · ".join(p["spellings"]) if len(p["spellings"]) > 1 else "",
         "Transactions": p["transactions"], "Checks": p["checks"], "Money in": p["money_in"],
         "Money out": p["money_out"], "Owes us": p["owed_to_us"], "We owe": p["we_owe"],
+        "Bank-text rules": rule_keys.get(db._payee_key(p["party"], loose=True), 0),
         "Last activity": p["last_activity"]} for p in shown])
     st.caption("Select one or more rows, then rename or merge below.")
     money_cols = {c: st.column_config.NumberColumn(format="$%.2f") for c in ("Money in", "Money out", "Owes us", "We owe")}
@@ -1962,92 +2359,6 @@ elif page == "Parties":
         st.success(st.session_state.pop("party_message"))
 
 
-elif page == "Vendors":
-    page_header("Vendor and customer mappings",
-                "Store a short matching phrase once, then automatically apply its category and accounting treatment during future imports.",
-                "Mapping directory")
-    with db.connect(DB_PATH) as connection:
-        categories = db.list_categories(connection, business_id)
-        vendors = db.list_vendors(connection, business_id, include_inactive=True)
-    if not categories:
-        st.warning("Create at least one category before adding a vendor mapping.")
-        st.stop()
-    category_by_name = {item["name"]: item for item in categories}
-    category_defaults = {item["name"]: item["default_treatment"] for item in categories}
-    left, right = st.columns(2, gap="large")
-    with left:
-        section_label("Add a mapping")
-        new_vendor_name = st.text_input("Vendor / customer name", key="new_vendor_name")
-        new_vendor_pattern = st.text_input("Description contains", key="new_vendor_pattern",
-                                           placeholder="MULTIVISIONOPERA")
-        new_vendor_category_key = "new_vendor_category"
-        new_vendor_treatment_key = "new_vendor_treatment"
-        if new_vendor_treatment_key not in st.session_state:
-            st.session_state[new_vendor_treatment_key] = categories[0]["default_treatment"]
-        new_vendor_category = st.selectbox(
-            "Category", list(category_by_name), key=new_vendor_category_key,
-            on_change=sync_category_treatment,
-            args=(new_vendor_category_key, new_vendor_treatment_key, category_defaults))
-        new_vendor_treatment = st.selectbox("Treatment", list(db.TREATMENTS[:-1]), key=new_vendor_treatment_key)
-        new_vendor_apply = st.checkbox("Classify matching transactions already waiting", value=True,
-                                       key="new_vendor_apply")
-        if st.button("Add vendor mapping", type="primary", width="stretch"):
-            try:
-                with db.connect(DB_PATH) as connection:
-                    _, applied = db.upsert_vendor(
-                        connection, business_id=business_id, name=new_vendor_name,
-                        match_pattern=new_vendor_pattern,
-                        category_id=int(category_by_name[new_vendor_category]["id"]),
-                        treatment=new_vendor_treatment, apply_existing=new_vendor_apply)
-                st.success(f"Vendor saved. {applied} waiting transaction(s) were classified.")
-                rerun()
-            except Exception as exc:
-                st.error(str(exc))
-    with right:
-        section_label("Manage a mapping")
-        if not vendors:
-            st.info("No vendor mappings yet. Save one during Review or add it here.")
-        else:
-            vendor_by_label = {
-                f"{item['name']} · contains {item['match_pattern']}{' · inactive' if not item['active'] else ''}": item
-                for item in vendors
-            }
-            vendor_label = st.selectbox("Vendor mapping", list(vendor_by_label))
-            vendor = vendor_by_label[vendor_label]
-            with st.form("manage_vendor"):
-                edit_vendor_name = st.text_input("Name", value=vendor["name"])
-                edit_vendor_pattern = st.text_input("Description contains", value=vendor["match_pattern"])
-                edit_category_names = list(category_by_name)
-                edit_category_index = edit_category_names.index(vendor["category_name"]) if vendor["category_name"] in edit_category_names else 0
-                edit_vendor_category = st.selectbox("Category", edit_category_names, index=edit_category_index)
-                treatment_options = list(db.TREATMENTS[:-1])
-                edit_treatment_index = treatment_options.index(vendor["treatment"]) if vendor["treatment"] in treatment_options else 0
-                edit_vendor_treatment = st.selectbox("Treatment", treatment_options, index=edit_treatment_index)
-                edit_vendor_active = st.checkbox("Active", value=bool(vendor["active"]))
-                edit_vendor_apply = st.checkbox("Apply updated mapping to waiting transactions", value=True)
-                if st.form_submit_button("Save vendor changes", width="stretch"):
-                    try:
-                        with db.connect(DB_PATH) as connection:
-                            _, applied = db.upsert_vendor(
-                                connection, business_id=business_id, vendor_id=int(vendor["id"]),
-                                name=edit_vendor_name, match_pattern=edit_vendor_pattern,
-                                category_id=int(category_by_name[edit_vendor_category]["id"]),
-                                treatment=edit_vendor_treatment, active=edit_vendor_active,
-                                apply_existing=edit_vendor_apply)
-                        st.success(f"Vendor updated. {applied} waiting transaction(s) were classified.")
-                        rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
-    section_label("Vendor table")
-    if vendors:
-        vendor_frame = pd.DataFrame(vendors).rename(columns={
-            "name": "Vendor / customer", "match_pattern": "Description contains",
-            "category_name": "Category", "treatment": "Treatment", "hit_count": "Rule matches",
-            "active": "Active"})
-        st.dataframe(vendor_frame[["Vendor / customer", "Description contains", "Category", "Treatment", "Rule matches", "Active"]],
-                     hide_index=True, width="stretch")
-
-
 elif page == "Categories & Rules":
     page_header("Your accounting vocabulary",
                 "Categories organize reporting. Learned rules quietly handle repeat descriptions and remain fully editable.",
@@ -2098,12 +2409,47 @@ elif page == "Categories & Rules":
         if rules:
             st.dataframe(pd.DataFrame(rules)[["id", "pattern", "account_name", "category_name", "treatment", "hit_count", "active"]],
                          hide_index=True, width="stretch")
-            rule_ids = {f"#{item['id']} · {item['pattern'][:70]}": item for item in rules}
-            chosen = st.selectbox("Rule", list(rule_ids))
-            active = bool(rule_ids[chosen]["active"])
-            if st.button("Disable rule" if active else "Enable rule"):
+            rule_ids = {f"#{item['id']} · {item['pattern'][:70]}{' · off' if not item['active'] else ''}": item for item in rules}
+            chosen = st.selectbox("Rule to edit", list(rule_ids))
+            rule = rule_ids[chosen]
+            with db.connect(DB_PATH) as connection:
+                rule_categories = db.list_categories(connection, business_id)
+                rule_accounts = db.list_accounts(connection, business_id)
+            cat_names = ["(none)"] + [c["name"] for c in rule_categories]
+            cat_now = rule["category_name"] if rule["category_name"] in cat_names else "(none)"
+            acct_names = ["(none)"] + [a["name"] for a in rule_accounts]
+            acct_now = rule["related_account_name"] if rule["related_account_name"] in acct_names else "(none)"
+            treatments = list(db.TREATMENTS[:-1])
+            st.caption(f"Applies to: {rule['account_name'] or 'all accounts'} · matched {rule['hit_count']} transaction(s)")
+            with st.form(f"edit_rule_{rule['id']}"):
+                e_pattern = st.text_input("Description contains", value=rule["pattern"])
+                e1, e2 = st.columns(2)
+                e_category = e1.selectbox("Category", cat_names, index=cat_names.index(cat_now))
+                e_treatment = e2.selectbox("Treatment", treatments,
+                                           index=treatments.index(rule["treatment"]) if rule["treatment"] in treatments else 0)
+                e3, e4 = st.columns(2)
+                e_related = e3.selectbox("Related account (transfers)", acct_names, index=acct_names.index(acct_now))
+                e_priority = e4.number_input("Priority (higher wins)", value=int(rule["priority"]), step=10)
+                e_active = st.checkbox("Active", value=bool(rule["active"]))
+                e_apply = st.checkbox("Apply to transactions still waiting for review", value=False)
+                if st.form_submit_button("Save rule changes", type="primary", width="stretch"):
+                    try:
+                        with db.connect(DB_PATH) as connection:
+                            applied = db.update_rule(
+                                connection, int(rule["id"]), pattern=e_pattern,
+                                category_id=next((c["id"] for c in rule_categories if c["name"] == e_category), None),
+                                treatment=e_treatment,
+                                related_account_id=next((a["id"] for a in rule_accounts if a["name"] == e_related), None),
+                                priority=int(e_priority), active=e_active, apply_existing=e_apply)
+                        st.success(f"Rule updated. {applied} waiting transaction(s) classified.")
+                        rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            confirm_delete = st.checkbox("I want to delete this rule", key=f"confirm_rule_delete_{rule['id']}")
+            if st.button("Delete rule", disabled=not confirm_delete, key=f"delete_rule_{rule['id']}"):
                 with db.connect(DB_PATH) as connection:
-                    db.set_rule_active(connection, int(rule_ids[chosen]["id"]), not active)
+                    db.delete_rule(connection, int(rule["id"]))
+                st.success("Rule deleted. Transactions it classified keep their classification.")
                 rerun()
         else:
             st.info("Rules appear here after you categorize transactions.")

@@ -607,5 +607,95 @@ class BooksTests(unittest.TestCase):
                     name="", amount=10)
 
 
+    def test_loan_exclusion_and_vendor_reports(self):
+        with db.connect(self.path) as connection:
+            def add(day, amount, treatment, party=None, desc=None, category=None):
+                tid, _, _ = db.insert_transaction(
+                    connection, business_id=self.business, account_id=self.account, transaction_date=day,
+                    posting_date=None, description=desc or f"TXN {day} {amount}", source_amount=amount, signed_amount=amount)
+                db.update_transaction_classification(connection, tid, category_id=category, treatment=treatment)
+                if party:
+                    connection.execute("UPDATE transactions SET counterparty = ? WHERE id = ?", (party, tid))
+                return tid
+            add("2026-01-05", -4000, "Loan receivable", "Colina Tech Solutions")
+            add("2026-02-05", 1000, "Receivable repayment", "Colina Tech Solutions LLC")
+            add("2026-03-05", 5000, "Loan draw", "Bank Lender")
+            add("2026-03-06", 500, "Transfer")
+            add("2026-03-07", 250, "Owner contribution")
+            add("2026-04-01", 900, "Revenue", "Acme Corp")
+            add("2026-04-02", -300, "Expense", None, "DIGITALOCEAN.COM 123", self.category)
+            add("2026-04-03", 40, "Expense refund", None, "DIGITALOCEAN.COM 456", self.category)
+            report = {r["party"]: r for r in db.loan_report(connection, self.business)}
+            self.assertEqual(report["Colina Tech Solutions LLC"]["owed_to_us"], 3000.0)
+            self.assertEqual(report["Bank Lender"]["we_owe"], 5000.0)
+            self.assertEqual(len(db.loan_ledger(connection, self.business)), 3)
+            self.assertEqual(len(db.loan_report(connection, self.business, "2026-02-01", "2026-12-31")), 2)
+            reasons = sorted(r["reason"] for r in db.excluded_from_pnl(connection, self.business))
+            self.assertEqual(reasons, ["Internal transfer", "Loan made", "Loan received", "Loan repayment received",
+                                       "Owner contribution"])
+            vendors = {r["party"]: r for r in db.vendor_report(connection, self.business)}
+            self.assertEqual(vendors["Acme Corp"]["revenue"], 900.0)
+            digital = next(v for name, v in vendors.items() if "Digitalocean" in name)
+            self.assertEqual((digital["expense"], digital["transactions"]), (260.0, 2))
+            self.assertEqual(db.vendor_report(connection, self.business, "2026-05-01", "2026-12-31"), [])
+
+
+    def test_margin_mapping(self):
+        with db.connect(self.path) as connection:
+            def add(day, amount, treatment, party):
+                tid, _, _ = db.insert_transaction(
+                    connection, business_id=self.business, account_id=self.account, transaction_date=day,
+                    posting_date=None, description=f"TXN {day} {amount} {party}", source_amount=amount, signed_amount=amount)
+                db.update_transaction_classification(connection, tid, category_id=None, treatment=treatment)
+                connection.execute("UPDATE transactions SET counterparty = ? WHERE id = ?", (party, tid))
+            add("2026-01-10", 10000, "Revenue", "Acme Corp")
+            add("2026-02-10", 5000, "Revenue", "Globex")
+            add("2026-01-15", -6000, "Expense", "Consultant One")
+            add("2026-02-15", -1500, "Expense", "Consultant Two")
+            add("2026-03-15", -200, "Expense", "Random Vendor")
+            report = db.margin_report(connection, self.business)
+            self.assertTrue(all(not c["mapped"] for c in report["customers"]))
+            self.assertEqual(len(report["unmapped_expenses"]), 3)
+            db.set_margin_links(connection, business_id=self.business, revenue_party="Acme Corp",
+                                expense_parties=["Consultant One", "Consultant Two"])
+            report = db.margin_report(connection, self.business)
+            acme = next(c for c in report["customers"] if c["customer"] == "Acme Corp")
+            self.assertEqual((acme["revenue"], acme["mapped_expense"], acme["margin"], acme["margin_pct"]),
+                             (10000.0, 7500.0, 2500.0, 25.0))
+            self.assertEqual([u["party"] for u in report["unmapped_expenses"]], ["Random Vendor"])
+            # an expense company belongs to one revenue company: re-mapping moves it
+            db.set_margin_links(connection, business_id=self.business, revenue_party="Globex",
+                                expense_parties=["Consultant Two"])
+            report = db.margin_report(connection, self.business)
+            self.assertEqual({c["customer"]: c["mapped_expense"] for c in report["customers"]},
+                             {"Acme Corp": 6000.0, "Globex": 1500.0})
+            # period filter
+            feb = db.margin_report(connection, self.business, "2026-02-01", "2026-02-28")
+            self.assertEqual({c["customer"]: c["revenue"] for c in feb["customers"]}["Globex"], 5000.0)
+            # renaming a party carries its mappings along
+            db.rename_party(connection, business_id=self.business, old_names=["Acme Corp"], new_name="Acme Corporation")
+            self.assertEqual(db.list_margin_links(connection, self.business)[0]["revenue_party"], "Acme Corporation")
+            with self.assertRaises(ValueError):
+                db.set_margin_links(connection, business_id=self.business, revenue_party="Globex", expense_parties=["globex"])
+            link_ids = [l["id"] for l in db.list_margin_links(connection, self.business)]
+            self.assertEqual(db.delete_margin_links(connection, self.business, link_ids), 2)
+
+    def test_edit_and_delete_learned_rule(self):
+        with db.connect(self.path) as connection:
+            rule_id, _ = db.learn_rule(connection, business_id=self.business, account_id=self.account,
+                                       pattern="ACME PAYMENT", category_id=None, treatment="Expense", apply_existing=False)
+            other_id, _ = db.learn_rule(connection, business_id=self.business, account_id=self.account,
+                                        pattern="GLOBEX", category_id=None, treatment="Expense", apply_existing=False)
+            db.update_rule(connection, rule_id, pattern="acme pay", category_id=None, treatment="Revenue",
+                           priority=200, active=False)
+            row = next(r for r in db.list_rules(connection, self.business) if r["id"] == rule_id)
+            self.assertEqual((row["treatment"], row["priority"], row["active"]), ("Revenue", 200, 0))
+            self.assertEqual(row["pattern"], db.normalize_description("acme pay"))
+            with self.assertRaises(ValueError):
+                db.update_rule(connection, other_id, pattern="acme pay", category_id=None, treatment="Expense")
+            db.delete_rule(connection, rule_id)
+            self.assertEqual([r["id"] for r in db.list_rules(connection, self.business)], [other_id])
+
+
 if __name__ == "__main__":
     unittest.main()

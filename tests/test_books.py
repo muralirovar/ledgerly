@@ -696,6 +696,274 @@ class BooksTests(unittest.TestCase):
             db.delete_rule(connection, rule_id)
             self.assertEqual([r["id"] for r in db.list_rules(connection, self.business)], [other_id])
 
+    def test_loan_direction_guard(self):
+        with db.connect(self.path) as connection:
+            self.assertIsNotNone(db.loan_direction_error(4400, "Principal repayment"))
+            self.assertIsNotNone(db.loan_direction_error(-10, "Loan draw"))
+            self.assertIsNone(db.loan_direction_error(4400, "Receivable repayment"))
+            # a loan rule must not capture money moving the other way
+            db.learn_rule(connection, business_id=self.business, account_id=self.account, pattern="MOBILE DEPOSIT",
+                          category_id=None, treatment="Loan draw", apply_existing=False)
+            credit = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-03-01", posting_date=None, description="MOBILE DEPOSIT", source_amount=50,
+                signed_amount=50)
+            debit = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-03-02", posting_date=None, description="MOBILE DEPOSIT", source_amount=-50,
+                signed_amount=-50)
+            self.assertTrue(credit[2])
+            self.assertFalse(debit[2])
+            # a wrong-direction entry is found and can be corrected
+            connection.execute("UPDATE transactions SET treatment = 'Principal repayment' WHERE id = ?", (credit[0],))
+            problems = db.loan_direction_problems(connection, self.business)
+            self.assertEqual([p["id"] for p in problems], [credit[0]])
+            with self.assertRaises(ValueError):
+                db.fix_loan_rows(connection, self.business, [{"id": credit[0], "treatment": "Principal repayment"}])
+            db.fix_loan_rows(connection, self.business,
+                             [{"id": credit[0], "treatment": "Receivable repayment", "counterparty": "Colina"}])
+            self.assertEqual(db.loan_direction_problems(connection, self.business), [])
+            # the owner's own money filed as a loan is flagged and moves out of the loan books
+            out = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-03-05", posting_date=None, description="TRANSFER TO CHK 9651", source_amount=-70,
+                signed_amount=-70, treatment="Loan receivable", status="confirmed")
+            connection.execute("UPDATE transactions SET counterparty = 'Owner contribution' WHERE id = ?", (out[0],))
+            owner = [p for p in db.loan_direction_problems(connection, self.business) if p["id"] == out[0]][0]
+            self.assertEqual(owner["suggested"], "Owner draw")
+            db.fix_loan_rows(connection, self.business, [{"id": out[0], "treatment": "Owner draw", "counterparty": "Owner"}])
+            self.assertEqual([r["party"] for r in db.loan_report(connection, self.business)], ["Colina"])
+            self.assertIsNotNone(db.loan_direction_error(-70, "Owner contribution"))
+
+    def test_per_business_categories_copy_and_split(self):
+        with db.connect(self.path) as connection:
+            other = db.get_or_create_business(connection, "Other Business")
+            first = db.get_or_create_category(connection, self.business, "Legal expense", "Expense")
+            second = db.get_or_create_category(connection, other, "legal EXPENSE", "Expense")
+            self.assertNotEqual(first, second)
+            self.assertNotIn("Legal expense", {c["name"] for c in db.list_categories(connection, other)} - {"legal EXPENSE"})
+            with self.assertRaises(ValueError):
+                db.update_category(connection, db.get_or_create_category(connection, self.business, "Rent", "Expense"),
+                                   name="Legal Expense", default_treatment="Expense", active=True)
+            # copying never overwrites and also copies bank-text rules with their category
+            self.assertEqual(db.copy_categories(connection, self.business, other, ["Legal expense", "Rent"]),
+                             {"copied": 1, "skipped": 1})
+            now = "2026-01-01"
+            connection.execute("INSERT INTO vendors(business_id, name, match_pattern, category_id, treatment, created_at, updated_at) "
+                               "VALUES (?, 'Acme', 'ACME', ?, 'Expense', ?, ?)", (self.business, first, now, now))
+            self.assertEqual(db.copy_bank_text_rules(connection, self.business, other), {"copied": 1, "skipped": 0})
+            self.assertEqual(db.copy_bank_text_rules(connection, self.business, other), {"copied": 0, "skipped": 1})
+            # a legacy shared category is split so each business owns its copy
+            txn = db.insert_transaction(connection, business_id=other, account_id=db.get_or_create_account(
+                connection, other, "Chk", "checking"), transaction_date="2026-04-01", posting_date=None,
+                description="X", source_amount=-5, signed_amount=-5, category_id=first, treatment="Expense", status="confirmed")
+            db.set_setting(connection, "categories_split_v1", "")
+            db.split_categories_by_business(connection)
+            owner = connection.execute("SELECT c.business_id FROM transactions t JOIN categories c ON c.id = t.category_id "
+                                       "WHERE t.id = ?", (txn[0],)).fetchone()[0]
+            self.assertEqual(owner, other)
+            # rule learning skips one-off and loan rules; cleanup finds the old ones
+            self.assertFalse(db.should_learn_rule("CHECK 140", "Expense"))
+            self.assertFalse(db.should_learn_rule("MOBILE DEPOSIT", "Loan draw"))
+            self.assertTrue(db.should_learn_rule("COLINA TECH ZELLE", "Receivable repayment"))
+            self.assertTrue(db.should_learn_rule("DIGITALOCEAN", "Expense"))
+            db.learn_rule(connection, business_id=self.business, account_id=None, pattern="CHECK 140",
+                          category_id=None, treatment="Expense", apply_existing=False)
+            db.learn_rule(connection, business_id=self.business, account_id=None, pattern="DEPOSIT",
+                          category_id=None, treatment="Loan draw", apply_existing=False)
+            db.learn_rule(connection, business_id=self.business, account_id=None, pattern="DIGITALOCEAN",
+                          category_id=None, treatment="Expense", apply_existing=False)
+            found = db.rule_cleanup_candidates(connection, self.business)
+            self.assertEqual({r["pattern"] for r in found}, {"CHECK 140", "DEPOSIT"})
+            self.assertEqual(db.delete_rules(connection, self.business, [r["id"] for r in found]), 2)
+
+    def test_split_log_and_revert(self):
+        with db.connect(self.path) as connection:
+            rev = db.get_or_create_category(connection, self.business, "Services", "Revenue")
+            txn = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-06-01", posting_date=None, description="MOBILE DEPOSIT", source_amount=1000,
+                signed_amount=1000, status="needs_review")[0]
+            before = {r["id"]: r for r in db.account_summaries(connection, self.business)}
+            with self.assertRaises(ValueError):
+                db.split_transaction(connection, business_id=self.business, transaction_id=txn,
+                                     lines=[{"amount": 600, "treatment": "Revenue"}, {"amount": 300, "treatment": "Revenue"}])
+            with self.assertRaises(ValueError):  # money in cannot be a loan we made
+                db.split_transaction(connection, business_id=self.business, transaction_id=txn,
+                                     lines=[{"amount": 600, "treatment": "Loan receivable"}, {"amount": 400, "treatment": "Revenue"}])
+            ids = db.split_transaction(connection, business_id=self.business, transaction_id=txn, lines=[
+                {"amount": 600, "category_id": rev, "treatment": "Revenue", "counterparty": "Acme"},
+                {"amount": 400, "treatment": "Receivable repayment", "counterparty": "Colina"}])
+            self.assertEqual(len(ids), 2)
+            parent = db.get_transaction(connection, txn)
+            self.assertEqual((parent["status"], parent["treatment"]), ("split", "Excluded"))
+            self.assertEqual({r["id"]: r for r in db.account_summaries(connection, self.business)}, before)
+            report = {r["category"]: r for r in db.category_summary(connection, self.business)}
+            self.assertEqual(report["Services"]["revenue"], 600)
+            listed = [r["id"] for r in db.list_unreconciled_deposits(connection, self.business, self.account, checks_only=False)]
+            self.assertIn(txn, listed)  # the original stays available for attaching check images
+            self.assertFalse(set(ids) & set(listed))
+            self.assertNotIn(txn, [r["id"] for r in db.excluded_from_pnl(connection, self.business)])
+            with self.assertRaises(ValueError):
+                db.update_transaction_classification(connection, txn, category_id=None, treatment="Revenue")
+            with self.assertRaises(ValueError):  # locked until the split is reverted
+                db.split_transaction(connection, business_id=self.business, transaction_id=txn, lines=[
+                    {"amount": 500, "treatment": "Revenue"}, {"amount": 500, "treatment": "Revenue"}])
+            with self.assertRaises(ValueError):
+                db.set_transaction_counterparty(connection, business_id=self.business, transaction_id=txn, counterparty="X")
+            self.assertEqual(len(db.get_split_lines(connection, txn)), 2)
+            self.assertEqual(db.revert_split(connection, business_id=self.business, transaction_id=txn), 2)
+            restored = db.get_transaction(connection, txn)
+            self.assertEqual((restored["status"], restored["treatment"]), ("needs_review", "Needs review"))
+            self.assertEqual(db.get_split_lines(connection, txn), [])
+            self.assertEqual([r["action"] for r in db.list_split_log(connection, self.business)],
+                             ["revert", "split"])
+
+    def test_multi_check_deposit_needs_split(self):
+        with db.connect(self.path) as connection:
+            txn = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-07-01", posting_date=None, description="MOBILE DEPOSIT", source_amount=700,
+                signed_amount=700, status="needs_review")[0]
+            db.confirm_deposit_checks(connection, business_id=self.business, account_id=self.account,
+                transaction_id=txn, bank_name="B", account_last4="1", category_id=None, treatment=None, needs_split=True,
+                deposited_checks=[{"check_number": "11", "payer": "Acme", "amount": 500},
+                                  {"check_number": "CASH-1-2", "payer": "", "amount": 200, "memo": "Cash deposit"}])
+            row = db.get_transaction(connection, txn)
+            self.assertEqual((row["status"], row["treatment"], row["notes"]), ("needs_review", "Needs review", "Needs split: 2 checks"))
+            self.assertEqual(len(db.deposit_check_lines(connection, txn)), 2)
+            register = db.list_check_register(connection, self.business)
+            self.assertEqual({r["lines_on_transaction"] for r in register if r["transaction_id"] == txn}, {2})
+            self.assertEqual([r for r in db.list_transactions(connection, self.business) if r["id"] == txn][0]["linked_checks"], 2)
+
+    def test_attachments(self):
+        with db.connect(self.path) as connection:
+            txn = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-08-01", posting_date=None, description="STAPLES", source_amount=-20,
+                signed_amount=-20)[0]
+            first = db.add_attachment(connection, business_id=self.business, transaction_id=txn,
+                                      file_name="receipt.pdf", data=b"%PDF-1.4 test")
+            self.assertEqual(db.add_attachment(connection, business_id=self.business, transaction_id=txn,
+                                               file_name="receipt.pdf", data=b"%PDF-1.4 test"), first)
+            with self.assertRaises(ValueError):
+                db.add_attachment(connection, business_id=self.business, transaction_id=txn, file_name="x.exe", data=b"1")
+            with self.assertRaises(ValueError):
+                db.add_attachment(connection, business_id=self.business + 9, transaction_id=txn, file_name="a.pdf", data=b"1")
+            self.assertEqual([a["file_name"] for a in db.list_attachments(connection, self.business, txn)], ["receipt.pdf"])
+            self.assertEqual(db.get_attachment_data(connection, self.business, first), b"%PDF-1.4 test")
+            self.assertIsNone(db.get_attachment_data(connection, self.business + 9, first))
+            self.assertEqual([r for r in db.list_transactions(connection, self.business) if r["id"] == txn][0]["attachments"], 1)
+            self.assertTrue(db.delete_attachment(connection, self.business, first))
+            db.add_attachment(connection, business_id=self.business, transaction_id=txn, file_name="a.pdf", data=b"1")
+            db.add_attachment(connection, business_id=self.business, transaction_id=txn, file_name="b.pdf", data=b"22")
+            self.assertEqual(db.clear_attachments(connection, self.business, txn), 2)
+            self.assertEqual(db.list_attachments(connection, self.business, txn), [])
+
+    def test_document_parsing_and_matching(self):
+        from books import documents
+        parsed = documents.parse_document("ACME Office Supplies Inc\nInvoice # INV-20418\nDate: 03/14/2026\nSubtotal $20.00\nTax $1.60\nTotal $21.60")
+        self.assertEqual((parsed["total"], parsed["dates"], parsed["invoice"], parsed["vendor"]),
+                         (21.6, ["2026-03-14"], "INV-20418", "ACME Office Supplies Inc"))
+        self.assertFalse(documents.parse_document("")["has_text"])
+        with db.connect(self.path) as connection:
+            near = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-03-15", posting_date=None, description="ACME OFFICE SUPPLIES", source_amount=-21.6,
+                signed_amount=-21.6)[0]
+            db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2025-01-02", posting_date=None, description="OTHER", source_amount=-21.6, signed_amount=-21.6)
+            found = documents.match_candidates(connection, self.business, parsed)
+            self.assertEqual(found[0]["id"], near)
+            self.assertGreaterEqual(found[0]["score"], 5)
+
+    def test_loan_notes(self):
+        with db.connect(self.path) as connection:
+            txn = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-05-01", posting_date=None, description="LOAN OUT", source_amount=-900,
+                signed_amount=-900, treatment="Loan receivable", status="confirmed")
+            row = db.loan_ledger(connection, self.business)[0]
+            self.assertEqual((row["kind"], row["id"], row["notes"]), ("transaction", txn[0], ""))
+            self.assertEqual(db.set_loan_notes(connection, self.business,
+                             [{"kind": "transaction", "id": txn[0], "notes": "  Working   capital for payroll "}]), 1)
+            self.assertEqual(db.loan_ledger(connection, self.business)[0]["notes"], "Working capital for payroll")
+            # another business cannot edit it
+            self.assertEqual(db.set_loan_notes(connection, self.business + 99,
+                             [{"kind": "transaction", "id": txn[0], "notes": "x"}]), 0)
+
+
+    def test_staff_payments_and_company_revenue(self):
+        from books import staff
+        with db.connect(self.path) as connection:
+            staff.add_payment(connection, self.business, name="Ann Lee", month="2026-03", amount=4000, note="chk 101")
+            staff.add_payment(connection, self.business, name="ann lee", month="2026-03", amount=500)
+            staff.add_payment(connection, self.business, name="Cy Co LLC", month="2026-03", amount=2500)
+            with self.assertRaises(ValueError):
+                staff.add_payment(connection, self.business, name="", month="2026-03", amount=5)
+            with self.assertRaises(ValueError):
+                staff.add_payment(connection, self.business, name="Ann Lee", month="2026-03", amount=0)
+            self.assertEqual(len(staff.list_staff(connection, self.business)), 2)
+            self.assertEqual(staff.paid_by_month(connection, self.business)["2026-03"], 7000)
+            out, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-03-31", posting_date=None, description="ZELLE PAYMENT TO CY CO LLC",
+                source_amount=-2500, signed_amount=-2500)
+            found = staff.payment_suggestions(connection, self.business, "2026-03")
+            self.assertEqual(found[0]["transaction"]["id"], out)
+            self.assertEqual(found[0]["payment"]["staff"], "Cy Co LLC")
+            payroll = db.get_or_create_category(connection, self.business, "Payroll", "Expense")
+            with self.assertRaises(ValueError):
+                staff.link_payment(connection, self.business, found[0]["payment"]["id"] - 1, out)
+            staff.link_payment(connection, self.business, found[0]["payment"]["id"], out, category_id=payroll)
+            self.assertEqual(db.get_transaction(connection, out)["counterparty"], "Cy Co LLC")
+            self.assertEqual(staff.payment_suggestions(connection, self.business, "2026-03"), [])
+            first, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-03-10", posting_date=None, description="WIRE FROM ACME CORP INV 1",
+                source_amount=9000, signed_amount=9000)
+            second, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-04-02", posting_date=None, description="ACME CORP PAYMENT",
+                source_amount=1000, signed_amount=1000)
+            db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-03-11", posting_date=None, description="OTHER CLIENT",
+                source_amount=50, signed_amount=50)
+            found_rev = staff.revenue_candidates(connection, self.business, "Acme Corp", "2026-03-01", "2026-04-30")
+            self.assertEqual([r["id"] for r in found_rev], [first, second])
+            staff.save_revenue_picks(connection, self.business, "Acme Corp", [first, second], [first])
+            totals = staff.revenue_by_month(connection, self.business)
+            self.assertEqual([(r["month"], r["total"]) for r in totals], [("2026-03", 9000)])
+            # picked by another company: hidden from a different company's list
+            self.assertEqual(staff.revenue_candidates(connection, self.business, "Wire From", "2026-03-01", "2026-03-31"), [])
+            found_names = staff.name_matches(connection, self.business, "Ann Lee", "2026-03")
+            self.assertEqual(found_names, [])
+            ann_check, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-03-15", posting_date=None, description="ZELLE PAYMENT TO ANN LEE FOR MARCH",
+                source_amount=-1200, signed_amount=-1200)
+            self.assertEqual([t["id"] for t in staff.name_matches(connection, self.business, "ann lee", "2026-03")], [ann_check])
+            self.assertEqual(staff.name_matches(connection, self.business, "Ann Lee", "2026-04"), [])
+            april_pay, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-04-03", posting_date=None, description="CHECK PAID ANN LEE",
+                source_amount=-300, signed_amount=-300)
+            self.assertEqual([t["id"] for t in staff.name_matches(connection, self.business, "Ann Lee", "2026-03")], [ann_check])
+            self.assertEqual([t["id"] for t in staff.name_matches(connection, self.business, "Ann Lee", "2026-04")], [april_pay])
+            self.assertEqual(staff.add_payments_from_transactions(connection, self.business, name="Ann Lee",
+                                                                  month="2026-03", transaction_ids=[ann_check]), 1)
+            self.assertEqual(staff.name_matches(connection, self.business, "Ann Lee", "2026-03"), [])
+            self.assertEqual(staff.copy_payments(connection, self.business, "2026-03", "2026-04"), 4)
+            self.assertEqual(staff.copy_payments(connection, self.business, "2026-03", "2026-04"), 0)
+            self.assertEqual([p["transaction_id"] for p in staff.list_payments(connection, self.business, "2026-04")].count(None), 4)
+            with self.assertRaises(ValueError):
+                staff.copy_payments(connection, self.business, "2026-03", "2026-03")
+            self.assertEqual(staff.previous_month("2026-01"), "2025-12")
+            result = staff.autofill_payments(connection, self.business, "2026-04")
+            self.assertEqual((result["added"], result["no_match"]), (1, ["Cy Co LLC"]))
+            self.assertEqual(staff.autofill_payments(connection, self.business, "2026-04")["added"], 0)
+            result = staff.autofill_revenue(connection, self.business, "2026-04")
+            self.assertEqual((result["added"], result["no_match"]), (1, []))
+            self.assertEqual(staff.autofill_revenue(connection, self.business, "2026-04")["added"], 0)
+            self.assertEqual(sorted((r["month"], r["total"]) for r in staff.revenue_by_month(connection, self.business)),
+                             [("2026-03", 9000), ("2026-04", 1000)])
+            self.assertEqual(staff.months_between("2025-11", "2026-02"), ["2025-11", "2025-12", "2026-01", "2026-02"])
+            with self.assertRaises(ValueError):
+                staff.months_between("2026-03", "2026-01")
+            detail = staff.paid_detail(connection, self.business, "2026-03", "2026-04", ["ann lee"])
+            self.assertEqual({(r["name"], r["month"]) for r in detail}, {("Ann Lee", "2026-03"), ("Ann Lee", "2026-04")})
+            self.assertEqual([r["total"] for r in staff.revenue_detail(connection, self.business, "2026-03", "2026-03", ["Acme Corp"])], [9000])
+            self.assertEqual(staff.revenue_detail(connection, self.business, "2026-03", "2026-03", ["Nobody"]), [])
+            summary = staff.summary(connection, self.business, ["2026-03"])[0]
+            self.assertEqual((summary["paid"], summary["revenue"], summary["margin"]), (8200, 9000, 800))
+
 
 if __name__ == "__main__":
     unittest.main()

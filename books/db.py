@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -21,6 +22,7 @@ TREATMENTS = (
     "Loan receivable",
     "Receivable repayment",
     "Owner contribution",
+    "Owner draw",
     "Excluded",
     "Needs review",
 )
@@ -36,6 +38,27 @@ ACCOUNT_TYPES = (
 
 CHECK_TYPES = ("payment", "deposit")
 LOAN_TREATMENTS = ("Loan draw", "Principal repayment", "Loan receivable", "Receivable repayment")
+# Money in: we borrowed, or someone repaid us. Money out: we repaid, or we lent.
+LOAN_MONEY_IN = ("Loan draw", "Receivable repayment")
+LOAN_MONEY_OUT = ("Principal repayment", "Loan receivable")
+
+
+# Treatments that only make sense one way. Owner money is separate from loans: it is neither income nor a loan.
+MONEY_IN_ONLY = LOAN_MONEY_IN + ("Owner contribution",)
+MONEY_OUT_ONLY = LOAN_MONEY_OUT + ("Owner draw",)
+
+
+def loan_direction_error(signed_amount: float, treatment: str) -> str | None:
+    """A message when a loan or owner-money treatment points the wrong way for the money, else None."""
+    if treatment in MONEY_IN_ONLY and float(signed_amount) < 0:
+        return (f"{treatment} is for money coming in, but this is money going out. "
+                f"Use {' or '.join(MONEY_OUT_ONLY)} instead.")
+    if treatment in MONEY_OUT_ONLY and float(signed_amount) > 0:
+        return (f"{treatment} is for money going out, but this is money coming in. "
+                f"Use {' or '.join(MONEY_IN_ONLY)} instead.")
+    return None
+
+
 LOAN_ROLES = {
     "Loan draw": "Borrowed from",
     "Principal repayment": "Repaid to",
@@ -219,6 +242,30 @@ CREATE TABLE IF NOT EXISTS transactions (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS transaction_split_log (
+    id INTEGER PRIMARY KEY,
+    business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    parent_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    parent_summary TEXT NOT NULL,
+    parent_amount REAL NOT NULL,
+    before_json TEXT,
+    lines_json TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transaction_attachments (
+    id INTEGER PRIMARY KEY,
+    business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    file_name TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    uploaded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_transaction ON transaction_attachments(transaction_id);
+
 CREATE INDEX IF NOT EXISTS idx_transactions_business_status
 ON transactions(business_id, status);
 CREATE INDEX IF NOT EXISTS idx_transactions_account_date
@@ -360,10 +407,18 @@ def init_db(db_path: str | Path) -> None:
                        WHERE r.transaction_id = transactions.id AND TRIM(COALESCE(r.payee, '')) <> ''
                        ORDER BY r.id LIMIT 1)
                    WHERE counterparty IS NULL""")
+        if "split_parent_id" not in transaction_columns:
+            connection.execute("ALTER TABLE transactions ADD COLUMN split_parent_id INTEGER")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_transactions_split_parent ON transactions(split_parent_id)")
         if "check_type" not in columns:
             connection.execute(
                 "ALTER TABLE check_register ADD COLUMN check_type TEXT NOT NULL DEFAULT 'payment'"
             )
+        if "notes" not in columns:
+            connection.execute("ALTER TABLE check_register ADD COLUMN notes TEXT")
+        split_categories_by_business(connection)
+        from . import staff as _staff  # local import: staff builds on this module
+        _staff.ensure_schema(connection)
 
 
 def slugify(name: str) -> str:
@@ -458,15 +513,17 @@ def get_or_create_category(
     name: str,
     default_treatment: str,
 ) -> int:
+    """Categories belong to one business: find this business's category by name (any case) or create it."""
+    clean = " ".join((name or "").split())
     row = connection.execute(
-        "SELECT id FROM categories WHERE business_id = ? AND name = ?",
-        (business_id, name),
+        "SELECT id FROM categories WHERE business_id = ? AND LOWER(name) = LOWER(?) ORDER BY active DESC, id LIMIT 1",
+        (business_id, clean),
     ).fetchone()
     if row:
         return int(row["id"])
     cursor = connection.execute(
         "INSERT INTO categories(business_id, name, default_treatment, created_at) VALUES (?, ?, ?, ?)",
-        (business_id, name, default_treatment, utc_now()),
+        (business_id, clean, default_treatment, utc_now()),
     )
     return int(cursor.lastrowid)
 
@@ -477,13 +534,13 @@ def list_categories(
     *,
     include_inactive: bool = False,
 ) -> list[dict[str, Any]]:
+    """The categories of one business."""
     active_filter = "" if include_inactive else " AND active = 1"
     return [
         dict(row)
         for row in connection.execute(
-            f"SELECT * FROM categories WHERE business_id = ?{active_filter} ORDER BY active DESC, name",
-            (business_id,),
-        )
+            f"SELECT * FROM categories WHERE business_id = ?{active_filter} ORDER BY active DESC, name COLLATE NOCASE",
+            (business_id,))
     ]
 
 
@@ -495,10 +552,107 @@ def update_category(
     default_treatment: str,
     active: bool,
 ) -> None:
+    clean = " ".join((name or "").split())
+    if not clean:
+        raise ValueError("Enter a category name.")
+    clash = connection.execute(
+        """SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND id <> ?
+           AND business_id = (SELECT business_id FROM categories WHERE id = ?)""",
+        (clean, category_id, category_id)).fetchone()
+    if clash:
+        raise ValueError("Another category in this business already has that name.")
     connection.execute(
         "UPDATE categories SET name = ?, default_treatment = ?, active = ? WHERE id = ?",
-        (name.strip(), default_treatment, 1 if active else 0, category_id),
+        (clean, default_treatment, 1 if active else 0, category_id),
     )
+
+
+def split_categories_by_business(connection: sqlite3.Connection) -> int:
+    """One-time migration: give every business its own copy of any category it uses.
+
+    Categories were briefly shared across businesses. Each business that references a category
+    owned by another business gets its own same-named copy and its rows are repointed at it.
+    """
+    if get_setting(connection, "categories_split_v1") == "done":
+        return 0
+    tables = [r["name"] for r in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+              if r["name"] != "categories"
+              and {c["name"] for c in connection.execute(f"PRAGMA table_info({r['name']})")} >= {"category_id", "business_id"}]
+    created = 0
+    for category in connection.execute("SELECT * FROM categories").fetchall():
+        for table in tables:
+            for row in connection.execute(
+                f"SELECT DISTINCT business_id FROM {table} WHERE category_id = ? AND business_id <> ?",
+                (category["id"], category["business_id"])).fetchall():
+                owner = int(row["business_id"])
+                existing = connection.execute(
+                    "SELECT id FROM categories WHERE business_id = ? AND LOWER(name) = LOWER(?)",
+                    (owner, category["name"])).fetchone()
+                if existing:
+                    target = int(existing["id"])
+                else:
+                    target = int(connection.execute(
+                        "INSERT INTO categories(business_id, name, default_treatment, active, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (owner, category["name"], category["default_treatment"], category["active"], utc_now())).lastrowid)
+                    created += 1
+                connection.execute(
+                    f"UPDATE {table} SET category_id = ? WHERE category_id = ? AND business_id = ?",
+                    (target, category["id"], owner))
+    set_setting(connection, "categories_split_v1", "done")
+    return created
+
+
+def copy_categories(connection: sqlite3.Connection, source_business_id: int, target_business_id: int,
+                    names: list[str] | None = None) -> dict[str, int]:
+    """Copy categories (name and default treatment) from one business to another; existing names are kept."""
+    if source_business_id == target_business_id:
+        raise ValueError("Choose two different businesses.")
+    copied = skipped = 0
+    for category in list_categories(connection, source_business_id):
+        if names is not None and category["name"] not in names:
+            continue
+        exists = connection.execute(
+            "SELECT 1 FROM categories WHERE business_id = ? AND LOWER(name) = LOWER(?)",
+            (target_business_id, category["name"])).fetchone()
+        if exists:
+            skipped += 1
+            continue
+        connection.execute(
+            "INSERT INTO categories(business_id, name, default_treatment, created_at) VALUES (?, ?, ?, ?)",
+            (target_business_id, category["name"], category["default_treatment"], utc_now()))
+        copied += 1
+    return {"copied": copied, "skipped": skipped}
+
+
+def copy_bank_text_rules(connection: sqlite3.Connection, source_business_id: int, target_business_id: int,
+                         vendor_ids: list[int] | None = None) -> dict[str, int]:
+    """Copy party bank-text rules to another business, creating any category they need there."""
+    if source_business_id == target_business_id:
+        raise ValueError("Choose two different businesses.")
+    copied = skipped = 0
+    for vendor in connection.execute(
+        """SELECT v.*, c.name AS category_name, c.default_treatment AS category_treatment
+           FROM vendors v LEFT JOIN categories c ON c.id = v.category_id
+           WHERE v.business_id = ? ORDER BY v.name""", (source_business_id,)).fetchall():
+        if vendor_ids is not None and int(vendor["id"]) not in vendor_ids:
+            continue
+        clash = connection.execute(
+            "SELECT 1 FROM vendors WHERE business_id = ? AND (LOWER(name) = LOWER(?) OR match_pattern = ?)",
+            (target_business_id, vendor["name"], vendor["match_pattern"])).fetchone()
+        if clash:
+            skipped += 1
+            continue
+        category_id = (get_or_create_category(connection, target_business_id, vendor["category_name"],
+                                              vendor["category_treatment"] or vendor["treatment"])
+                       if vendor["category_name"] else None)
+        now = utc_now()
+        connection.execute(
+            """INSERT INTO vendors(business_id, name, match_pattern, category_id, treatment, active, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (target_business_id, vendor["name"], vendor["match_pattern"], category_id, vendor["treatment"],
+             vendor["active"], now, now))
+        copied += 1
+    return {"copied": copied, "skipped": skipped}
 
 
 def update_business(connection: sqlite3.Connection, business_id: int, name: str) -> None:
@@ -545,6 +699,8 @@ def _match_rule(
     ).fetchall()
     for row in rows:
         rule = dict(row)
+        if loan_direction_error(signed_amount, rule["treatment"]):
+            continue
         pattern = rule["pattern"]
         if rule["match_type"] == "exact" and normalized_description == pattern:
             return rule
@@ -680,6 +836,14 @@ def list_import_batches(connection: sqlite3.Connection, business_id: int) -> lis
     ]
 
 
+def _direction_filter(treatment: str) -> str:
+    if treatment in MONEY_IN_ONLY:
+        return "AND signed_amount > 0"
+    if treatment in MONEY_OUT_ONLY:
+        return "AND signed_amount < 0"
+    return ""
+
+
 def learn_rule(
     connection: sqlite3.Connection,
     *,
@@ -734,6 +898,7 @@ def learn_rule(
                     reviewed_at = ?, updated_at = ?
                 WHERE business_id = ? {account_filter}
                   AND status = 'needs_review'
+                  {_direction_filter(treatment)}
                   AND normalized_description LIKE ?""",
             params,
         )
@@ -829,6 +994,31 @@ def set_vendor_active(connection: sqlite3.Connection, vendor_id: int, active: bo
         set_rule_active(connection, int(row["rule_id"]), active)
 
 
+ONE_OFF_PATTERN = re.compile(r"^(CHECK|CHK|DEPOSIT)?\s*#?\s*\d+$")
+
+
+GENERIC_BANK_WORDS = {
+    "MOBILE", "DEPOSIT", "ONLINE", "TRANSFER", "ACH", "CREDIT", "DEBIT", "PAYMENT", "WIRE",
+    "CHECK", "CHK", "ATM", "CASH", "BANK", "FROM", "TO", "BUS", "ZELLE", "POS", "PURCHASE",
+}
+
+
+def should_learn_rule(pattern: str, treatment: str) -> bool:
+    """Only learn rules that will help again.
+
+    A check number is unique to one check, and generic bank text such as MOBILE DEPOSIT says nothing
+    about who the money is with, so neither becomes a rule. Loan and owner-money rules are learned
+    when the text names someone specific; the direction guard still stops wrong-way matches.
+    """
+    clean = normalize_description(pattern)
+    if not clean or ONE_OFF_PATTERN.match(clean):
+        return False
+    if treatment in LOAN_TREATMENTS or treatment in ("Owner contribution", "Owner draw"):
+        words = [w for w in re.split(r"[^A-Z0-9]+", clean.upper()) if w and not w.isdigit()]
+        return any(w not in GENERIC_BANK_WORDS for w in words)
+    return True
+
+
 def classify_transaction(
     connection: sqlite3.Connection,
     transaction_id: int,
@@ -845,6 +1035,8 @@ def classify_transaction(
     ).fetchone()
     if not transaction:
         raise ValueError("Transaction not found")
+    if transaction["status"] == "split":
+        raise ValueError("This transaction is split. Edit or revert the split instead.")
     now = utc_now()
     connection.execute(
         """UPDATE transactions
@@ -855,6 +1047,8 @@ def classify_transaction(
         (category_id, treatment, related_account_id, notes, now, now, transaction_id),
     )
     rule_pattern = pattern or learned_pattern(transaction["description"])
+    if not should_learn_rule(rule_pattern, treatment):
+        return 0, 0
     rule_id, applied = learn_rule(
         connection,
         business_id=int(transaction["business_id"]),
@@ -880,6 +1074,8 @@ def update_transaction_classification(
     related_account_id: int | None = None,
     notes: str | None = None,
 ) -> None:
+    if connection.execute("SELECT 1 FROM transactions WHERE id = ? AND status = 'split'", (transaction_id,)).fetchone():
+        raise ValueError("This transaction is split. Edit or revert the split instead.")
     now = utc_now()
     if treatment is None:
         connection.execute(
@@ -954,6 +1150,7 @@ def update_rule(
             f"""UPDATE transactions SET category_id = ?, treatment = ?, related_account_id = ?,
                     learned_rule_id = ?, status = 'auto_classified', reviewed_at = ?, updated_at = ?
                 WHERE business_id = ? {account_filter} AND status = 'needs_review'
+                  {_direction_filter(treatment)}
                   AND normalized_description LIKE ?""", params).rowcount
         if applied:
             connection.execute("UPDATE rules SET hit_count = hit_count + ? WHERE id = ?", (applied, rule_id))
@@ -965,6 +1162,40 @@ def delete_rule(connection: sqlite3.Connection, rule_id: int) -> None:
     connection.execute("UPDATE transactions SET learned_rule_id = NULL WHERE learned_rule_id = ?", (rule_id,))
     connection.execute("UPDATE vendors SET rule_id = NULL WHERE rule_id = ?", (rule_id,))
     connection.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+
+
+def rule_cleanup_candidates(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
+    """Learned rules that are probably clutter or harmful, each with the reason. Nothing is deleted here."""
+    vendor_rule_ids = {r["rule_id"] for r in connection.execute(
+        "SELECT rule_id FROM vendors WHERE business_id = ? AND rule_id IS NOT NULL", (business_id,))}
+    out = []
+    for rule in list_rules(connection, business_id):
+        if rule["id"] in vendor_rule_ids:
+            continue  # written on purpose as a bank-text rule
+        reason = None
+        if ONE_OFF_PATTERN.match(rule["pattern"]):
+            reason = "One-off: matches a single check number"
+        elif rule["treatment"] in LOAN_TREATMENTS:
+            reason = "Loan treatment on generic bank text: loans depend on the party"
+        elif not rule["active"] and not rule["hit_count"]:
+            reason = "Switched off and never used"
+        elif rule["category_id"] is not None and not connection.execute(
+                "SELECT active FROM categories WHERE id = ?", (rule["category_id"],)).fetchone()["active"]:
+            reason = "Uses an inactive category"
+        if reason:
+            out.append({**rule, "reason": reason})
+    return out
+
+
+def delete_rules(connection: sqlite3.Connection, business_id: int, rule_ids: list[int]) -> int:
+    """Delete learned rules of this business. Transactions they classified keep their classification."""
+    count = 0
+    for rule_id in rule_ids:
+        owned = connection.execute("SELECT 1 FROM rules WHERE id = ? AND business_id = ?", (rule_id, business_id)).fetchone()
+        if owned:
+            delete_rule(connection, int(rule_id))
+            count += 1
+    return count
 
 
 def get_transaction(connection: sqlite3.Connection, transaction_id: int) -> dict[str, Any] | None:
@@ -1005,7 +1236,9 @@ def list_transactions(
             f"""SELECT t.id, t.transaction_date, t.posting_date, a.name AS account,
                        t.description, t.source_amount, t.signed_amount,
                        t.source_category, c.name AS category, t.treatment,
-                       t.counterparty, t.status, t.source_file, t.source_reference, t.notes
+                       t.counterparty, t.status, t.source_file, t.source_reference, t.notes, t.split_parent_id,
+                       (SELECT COUNT(*) FROM check_register r WHERE r.transaction_id = t.id) AS linked_checks,
+                       (SELECT COUNT(*) FROM transaction_attachments x WHERE x.transaction_id = t.id) AS attachments
                 FROM transactions t
                 JOIN accounts a ON a.id = t.account_id
                 LEFT JOIN categories c ON c.id = t.category_id
@@ -1025,7 +1258,7 @@ def dashboard(connection: sqlite3.Connection, business_id: int | None = None) ->
         params = (business_id,)
     rows = connection.execute(
         f"""SELECT b.id AS business_id, b.name AS business,
-            COUNT(t.id) AS transactions,
+            COUNT(CASE WHEN t.split_parent_id IS NULL THEN t.id END) AS transactions,
             SUM(CASE WHEN t.status = 'needs_review' THEN 1 ELSE 0 END) AS needs_review,
             COALESCE(SUM(CASE
                 WHEN t.treatment IN ('Revenue', 'Revenue refund') THEN t.signed_amount
@@ -1056,7 +1289,7 @@ def account_summaries(connection: sqlite3.Connection, business_id: int) -> list[
     result = []
     for account in accounts:
         movement = connection.execute(
-            "SELECT COALESCE(SUM(signed_amount), 0) AS value FROM transactions WHERE account_id = ?",
+            "SELECT COALESCE(SUM(signed_amount), 0) AS value FROM transactions WHERE account_id = ? AND split_parent_id IS NULL",
             (account["id"],),
         ).fetchone()["value"]
         if account["account_type"] == "line_of_credit":
@@ -1162,11 +1395,11 @@ def category_summary(connection: sqlite3.Connection, business_id: int) -> list[d
                     WHEN t.treatment = 'Expense refund' THEN -ABS(t.signed_amount)
                     ELSE 0 END), 0) AS expense
                FROM categories c
-               LEFT JOIN transactions t ON t.category_id = c.id
-               WHERE c.business_id = ? AND c.active = 1
+               LEFT JOIN transactions t ON t.category_id = c.id AND t.business_id = ?
+               WHERE c.active = 1 AND c.business_id = ?
                GROUP BY c.id, c.name, c.default_treatment
-               ORDER BY c.name""",
-            (business_id,),
+               ORDER BY c.name COLLATE NOCASE""",
+            (business_id, business_id),
         )
     ]
 
@@ -1293,6 +1526,7 @@ def find_check_transaction_candidates(
                FROM transactions t
                LEFT JOIN categories c ON c.id = t.category_id
                WHERE t.business_id = ? AND t.account_id = ?
+                 AND t.split_parent_id IS NULL
                  AND ABS(ABS(t.signed_amount) - ?) < 0.005
                  AND ABS(julianday(t.transaction_date) - julianday(?)) <= ?
                  AND (? IS NULL
@@ -1317,6 +1551,8 @@ def reset_transaction_review(connection: sqlite3.Connection, transaction_id: int
     if connection.execute(
         "SELECT 1 FROM check_register WHERE transaction_id = ? LIMIT 1", (transaction_id,)
     ).fetchone():
+        return
+    if connection.execute("SELECT 1 FROM transactions WHERE id = ? AND status = 'split'", (transaction_id,)).fetchone():
         return
     now = utc_now()
     connection.execute(
@@ -1386,10 +1622,12 @@ def confirm_check(
     )
     if previous and previous["transaction_id"] and previous["transaction_id"] != transaction_id:
         reset_transaction_review(connection, int(previous["transaction_id"]))
-    if transaction_id and payee.strip():
+    is_split_parent = bool(transaction_id) and bool(connection.execute(
+        "SELECT 1 FROM transactions WHERE id = ? AND status = 'split'", (transaction_id,)).fetchone())
+    if transaction_id and payee.strip() and not is_split_parent:
         connection.execute(
             "UPDATE transactions SET counterparty = ? WHERE id = ?", (payee.strip(), transaction_id))
-    if transaction_id and treatment:
+    if transaction_id and treatment and not is_split_parent:
         update_transaction_classification(
             connection, transaction_id, category_id=category_id, treatment=treatment,
             notes=f"Check #{check_number}: {payee.strip()}" + (f" - {memo.strip()}" if memo.strip() else ""),
@@ -1412,7 +1650,11 @@ def list_check_register(connection: sqlite3.Connection, business_id: int) -> lis
                       r.check_type,
                       r.payee, r.memo, r.bank_name, a.name AS account,
                       r.category_id, c.name AS category, r.treatment, r.transaction_id,
-                      r.source_file_name, r.confirmed_at
+                      r.source_file_name, r.confirmed_at,
+                      CASE WHEN r.transaction_id IS NULL THEN 0 ELSE
+                          (SELECT COUNT(*) FROM check_register r2 WHERE r2.transaction_id = r.transaction_id) END
+                          AS lines_on_transaction,
+                      (SELECT tt.status FROM transactions tt WHERE tt.id = r.transaction_id) AS transaction_status
                FROM check_register r
                JOIN accounts a ON a.id = r.account_id
                LEFT JOIN categories c ON c.id = r.category_id
@@ -1552,7 +1794,7 @@ def loan_ledger(
     clause, extra = _date_clause("t.transaction_date", start, end)
     for r in connection.execute(
         f"""SELECT t.id, t.transaction_date AS date, a.name AS account, t.description, t.signed_amount,
-                   t.treatment, t.counterparty
+                   t.treatment, t.counterparty, t.notes
             FROM transactions t JOIN accounts a ON a.id = t.account_id
             WHERE t.business_id = ? AND t.treatment IN ({marks}){clause}""",
         [business_id, *LOAN_TREATMENTS, *extra]):
@@ -1560,10 +1802,12 @@ def loan_ledger(
         rows.append({"date": r["date"], "party": names.get(_payee_key(party), party) if party else NO_PARTY,
                      "role": LOAN_ROLES[r["treatment"]], "treatment": r["treatment"],
                      "amount": abs(float(r["signed_amount"])), "account": r["account"],
-                     "description": r["description"], "source": "Bank transaction"})
+                     "description": r["description"], "source": "Bank transaction",
+                     "notes": r["notes"] or "", "kind": "transaction", "id": r["id"]})
     clause, extra = _date_clause("r.cleared_date", start, end)
     for r in connection.execute(
-        f"""SELECT r.cleared_date AS date, a.name AS account, r.check_number, r.amount, r.treatment, r.payee, r.memo
+        f"""SELECT r.id, r.cleared_date AS date, a.name AS account, r.check_number, r.amount, r.treatment, r.payee,
+                   r.memo, r.notes
             FROM check_register r JOIN accounts a ON a.id = r.account_id
             WHERE r.business_id = ? AND r.transaction_id IS NULL AND r.treatment IN ({marks}){clause}""",
         [business_id, *LOAN_TREATMENTS, *extra]):
@@ -1571,8 +1815,22 @@ def loan_ledger(
         rows.append({"date": r["date"], "party": names.get(_payee_key(party), party) if party else NO_PARTY,
                      "role": LOAN_ROLES[r["treatment"]], "treatment": r["treatment"],
                      "amount": float(r["amount"]), "account": r["account"],
-                     "description": f"Check #{r['check_number']} {r['memo'] or ''}".strip(), "source": "Check register"})
+                     "description": f"Check #{r['check_number']} {r['memo'] or ''}".strip(), "source": "Check register",
+                     "notes": r["notes"] or "", "kind": "check", "id": r["id"]})
     return sorted(rows, key=lambda x: (x["date"], x["party"]), reverse=True)
+
+
+def set_loan_notes(connection: sqlite3.Connection, business_id: int, edits: list[dict[str, Any]]) -> int:
+    """Save the reason for a loan on its bank transaction, or on a register check with no bank transaction."""
+    now = utc_now()
+    count = 0
+    for edit in edits:
+        notes = " ".join((edit.get("notes") or "").split()) or None
+        table = "transactions" if edit["kind"] == "transaction" else "check_register"
+        count += connection.execute(
+            f"UPDATE {table} SET notes = ?, updated_at = ? WHERE id = ? AND business_id = ?",
+            (notes, now, int(edit["id"]), business_id)).rowcount
+    return count
 
 
 def loan_report(
@@ -1594,10 +1852,61 @@ def loan_report(
     return sorted(report, key=lambda r: -(abs(r["owed_to_us"]) + abs(r["we_owe"])))
 
 
+def loan_direction_problems(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
+    """Loan and owner-money entries that need fixing: wrong way for the money, or filed under an owner party."""
+    treatments = LOAN_TREATMENTS + ("Owner contribution", "Owner draw")
+    rows = []
+    for r in connection.execute(
+        f"""SELECT t.id, t.transaction_date AS date, a.name AS account, t.description, t.signed_amount,
+                   t.treatment, t.counterparty
+            FROM transactions t JOIN accounts a ON a.id = t.account_id
+            WHERE t.business_id = ? AND t.treatment IN ({",".join("?" for _ in treatments)})
+            ORDER BY t.transaction_date DESC, t.id DESC""", [business_id, *treatments]):
+        wrong_way = loan_direction_error(r["signed_amount"], r["treatment"])
+        owner_party = (r["treatment"] in LOAN_TREATMENTS and "owner" in (r["counterparty"] or "").lower())
+        if wrong_way or owner_party:
+            item = dict(r)
+            money_in = r["signed_amount"] > 0
+            item["options"] = list(MONEY_IN_ONLY if money_in else MONEY_OUT_ONLY)
+            if owner_party:
+                item["suggested"] = "Owner contribution" if money_in else "Owner draw"
+            else:
+                item["suggested"] = "Receivable repayment" if money_in else "Principal repayment"
+            item["problem"] = ("Looks like the owner's own money, not a loan" if owner_party and not wrong_way
+                               else "Points the wrong way for the money")
+            rows.append(item)
+    return rows
+
+
+def fix_loan_rows(connection: sqlite3.Connection, business_id: int, fixes: list[dict[str, Any]]) -> int:
+    """Set a corrected loan treatment and party on transactions (and their linked register checks)."""
+    now = utc_now()
+    changed = 0
+    for fix in fixes:
+        txn = connection.execute(
+            "SELECT signed_amount FROM transactions WHERE id = ? AND business_id = ?",
+            (fix["id"], business_id)).fetchone()
+        if txn is None:
+            continue
+        treatment = fix["treatment"]
+        if (treatment not in LOAN_TREATMENTS + ("Owner contribution", "Owner draw")
+                or loan_direction_error(txn["signed_amount"], treatment)):
+            raise ValueError(f"Transaction #{fix['id']}: pick a treatment that matches the direction of the money.")
+        party = " ".join((fix.get("counterparty") or "").split())
+        connection.execute(
+            "UPDATE transactions SET treatment = ?, counterparty = ?, status = 'confirmed', updated_at = ? WHERE id = ?",
+            (treatment, party, now, fix["id"]))
+        connection.execute(
+            "UPDATE check_register SET treatment = ?, payee = CASE WHEN ? <> '' THEN ? ELSE payee END, updated_at = ? "
+            "WHERE transaction_id = ?", (treatment, party, party, now, fix["id"]))
+        changed += 1
+    return changed
+
+
 EXCLUDED_REASONS = {
     "Transfer": "Internal transfer", "Loan draw": "Loan received", "Principal repayment": "Loan repaid",
     "Loan receivable": "Loan made", "Receivable repayment": "Loan repayment received",
-    "Owner contribution": "Owner contribution", "Excluded": "Marked excluded",
+    "Owner contribution": "Owner contribution", "Owner draw": "Owner draw", "Excluded": "Marked excluded",
 }
 
 
@@ -1613,6 +1922,7 @@ def excluded_from_pnl(
     params: list[Any] = [business_id, *treatments]
     if include_unreviewed:
         condition = f"({condition} OR t.status = 'needs_review')"
+    condition = f"{condition} AND t.status <> 'split'"
     rows = []
     for r in connection.execute(
         f"""SELECT t.id, t.transaction_date AS date, a.name AS account, t.description, t.signed_amount,
@@ -1839,6 +2149,8 @@ def set_transaction_counterparty(
     suffix, such as Corp to Inc, is respected), and keeps a single
     linked check-register entry in step. Returns the name that was stored.
     """
+    if connection.execute("SELECT 1 FROM transactions WHERE id = ? AND status = 'split'", (transaction_id,)).fetchone():
+        raise ValueError("This transaction is split and locked. Revert the split first to change it.")
     name = canonical_payee(connection, business_id, counterparty, loose=False) if counterparty.strip() else ""
     cursor = connection.execute(
         "UPDATE transactions SET counterparty = ?, updated_at = ? WHERE id = ? AND business_id = ?",
@@ -2090,7 +2402,7 @@ def list_deposits(
     start: str | None = None, end: str | None = None,
 ) -> list[dict[str, Any]]:
     """Every credit (money in) with how it arrived and how it is currently accounted for."""
-    clauses = ["t.business_id = ?", "t.signed_amount > 0"]
+    clauses = ["t.business_id = ?", "t.signed_amount > 0", "t.split_parent_id IS NULL"]
     params: list[Any] = [business_id]
     if account_id:
         clauses.append("t.account_id = ?"); params.append(account_id)
@@ -2126,7 +2438,7 @@ def suggest_transfer_counterpart(
     leg = connection.execute(
         """SELECT t.id, t.transaction_date, t.account_id, a.name AS account_name
            FROM transactions t JOIN accounts a ON a.id = t.account_id
-           WHERE t.business_id = ? AND t.account_id <> ? AND ABS(t.signed_amount + ?) < 0.005
+           WHERE t.business_id = ? AND t.account_id <> ? AND t.split_parent_id IS NULL AND ABS(t.signed_amount + ?) < 0.005
              AND ABS(julianday(t.transaction_date) - julianday(?)) <= 7
            ORDER BY (t.treatment = 'Transfer') DESC, (t.status = 'needs_review') DESC,
                     ABS(julianday(t.transaction_date) - julianday(?)), t.id LIMIT 1""",
@@ -2254,7 +2566,7 @@ def classify_deposits(
     done = 0
     for transaction_id in transaction_ids:
         row = connection.execute(
-            "SELECT id FROM transactions WHERE id = ? AND business_id = ? AND signed_amount > 0",
+            "SELECT id FROM transactions WHERE id = ? AND business_id = ? AND signed_amount > 0 AND status <> 'split'",
             (int(transaction_id), business_id)).fetchone()
         if not row:
             continue
@@ -2281,7 +2593,7 @@ def list_unreconciled_deposits(
     start: str | None = None, end: str | None = None, checks_only: bool = True,
 ) -> list[dict[str, Any]]:
     """Credits on an account that have no check-register entry yet."""
-    clauses = ["t.business_id = ?", "t.account_id = ?", "t.signed_amount > 0",
+    clauses = ["t.business_id = ?", "t.account_id = ?", "t.signed_amount > 0", "t.split_parent_id IS NULL",
                "NOT EXISTS (SELECT 1 FROM check_register r WHERE r.transaction_id = t.id)"]
     params: list[Any] = [business_id, account_id]
     if start:
@@ -2307,7 +2619,8 @@ def confirm_deposit_checks(
     account_last4: str,
     deposited_checks: list[dict[str, Any]],
     category_id: int | None,
-    treatment: str,
+    treatment: str | None,
+    needs_split: bool = False,
 ) -> list[int]:
     """Record the checks that made up one bank deposit and tie them to that transaction.
 
@@ -2340,7 +2653,227 @@ def confirm_deposit_checks(
             bank_name=bank_name, account_last4=account_last4, statement_date=month_end.date().isoformat(),
             check_number=number, amount=float(item["amount"]), written_date=item.get("written_date"),
             cleared_date=cleared, payee=str(item.get("payer") or ""), memo=str(item.get("memo") or ""),
-            category_id=category_id, treatment=treatment,
+            category_id=item.get("category_id", category_id), treatment=item.get("treatment") or treatment,
             source_file_name=str(item.get("image_file") or ""), check_type="deposit"))
+    if needs_split and len(deposited_checks) > 1:
+        connection.execute(
+            """UPDATE transactions SET category_id = NULL, treatment = 'Needs review', status = 'needs_review',
+                   notes = ?, reviewed_at = NULL, updated_at = ? WHERE id = ? AND status <> 'split'""",
+            (f"Needs split: {len(deposited_checks)} checks", utc_now(), transaction_id))
     ensure_deposit_log_entries(connection, business_id)
     return ids
+
+
+def deposit_check_lines(connection: sqlite3.Connection, transaction_id: int) -> list[dict[str, Any]]:
+    """The checks recorded against one bank transaction, as starting lines for a split."""
+    return [dict(row) for row in connection.execute(
+        """SELECT r.check_number, r.amount, r.payee, r.memo, r.treatment, c.name AS category
+           FROM check_register r LEFT JOIN categories c ON c.id = r.category_id
+           WHERE r.transaction_id = ? ORDER BY r.id""", (transaction_id,))]
+
+
+# ---------------------------------------------------------------------------
+# Splitting one bank transaction into several lines
+# ---------------------------------------------------------------------------
+
+def _split_children(connection: sqlite3.Connection, parent_id: int) -> list[sqlite3.Row]:
+    return connection.execute(
+        "SELECT * FROM transactions WHERE split_parent_id = ? ORDER BY id", (parent_id,)).fetchall()
+
+
+def get_split_lines(connection: sqlite3.Connection, parent_id: int) -> list[dict[str, Any]]:
+    return [dict(row) for row in connection.execute(
+        """SELECT t.id, t.signed_amount, t.category_id, c.name AS category, t.treatment, t.counterparty,
+                  t.notes, t.related_account_id
+           FROM transactions t LEFT JOIN categories c ON c.id = t.category_id
+           WHERE t.split_parent_id = ? ORDER BY t.id""", (parent_id,))]
+
+
+def _log_split(connection: sqlite3.Connection, parent: sqlite3.Row, action: str,
+               before: dict[str, Any] | None, lines: list[dict[str, Any]]) -> None:
+    import json
+    connection.execute(
+        """INSERT INTO transaction_split_log(business_id, parent_id, action, parent_summary, parent_amount,
+                                             before_json, lines_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (parent["business_id"], parent["id"], action,
+         f"{parent['transaction_date']} · {parent['description']}"[:200], float(parent["signed_amount"]),
+         json.dumps(before) if before is not None else None, json.dumps(lines), utc_now()))
+
+
+def split_transaction(
+    connection: sqlite3.Connection, *, business_id: int, transaction_id: int, lines: list[dict[str, Any]],
+) -> list[int]:
+    """Replace one bank transaction by several lines that become the source for revenue and expense.
+
+    Each line has ``amount`` (positive), ``category_id``, ``treatment`` and optionally ``counterparty``,
+    ``notes`` and ``related_account_id``. The original stays on record, marked split and kept out of the
+    reports; it can be restored with :func:`revert_split`.
+    """
+    parent = connection.execute(
+        "SELECT * FROM transactions WHERE id = ? AND business_id = ?", (transaction_id, business_id)).fetchone()
+    if parent is None:
+        raise ValueError("Transaction not found.")
+    if parent["split_parent_id"]:
+        raise ValueError("This is already a line of a split. Split or revert the original transaction instead.")
+    if parent["status"] == "split":
+        raise ValueError("This transaction is already split and locked. Revert the split first to change it.")
+    if len(lines) < 2:
+        raise ValueError("A split needs at least two lines.")
+    total_cents = round(abs(float(parent["signed_amount"])) * 100)
+    if sum(round(float(line["amount"]) * 100) for line in lines) != total_cents:
+        raise ValueError(f"The lines must add up to ${abs(float(parent['signed_amount'])):,.2f}.")
+    sign = 1 if float(parent["signed_amount"]) >= 0 else -1
+    for line in lines:
+        if float(line["amount"]) <= 0:
+            raise ValueError("Every line needs an amount greater than zero.")
+        if line.get("treatment") in (None, "", "Needs review"):
+            raise ValueError("Choose a treatment for every line.")
+        problem = loan_direction_error(sign * float(line["amount"]), line["treatment"])
+        if problem:
+            raise ValueError(problem)
+    already = parent["status"] == "split"
+    if already:
+        before = _original_state(connection, transaction_id)
+        connection.execute(
+            "UPDATE check_register SET transaction_id = ? WHERE transaction_id IN "
+            "(SELECT id FROM transactions WHERE split_parent_id = ?)", (transaction_id, transaction_id))
+        connection.execute("DELETE FROM transactions WHERE split_parent_id = ?", (transaction_id,))
+    else:
+        before = {key: parent[key] for key in ("category_id", "treatment", "status", "counterparty", "notes",
+                                               "related_account_id", "learned_rule_id", "reviewed_at")}
+    now = utc_now()
+    ids = []
+    count = len(lines)
+    for position, line in enumerate(lines, start=1):
+        signed = round(sign * float(line["amount"]), 2)
+        cursor = connection.execute(
+            """INSERT INTO transactions(business_id, account_id, transaction_date, posting_date, description,
+                   normalized_description, source_amount, signed_amount, source_category, category_id, treatment,
+                   status, related_account_id, counterparty, source_file, source_reference, notes, import_batch_id,
+                   fingerprint, split_parent_id, reviewed_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (business_id, parent["account_id"], parent["transaction_date"], parent["posting_date"],
+             f"{parent['description']} [split {position}/{count}]", parent["normalized_description"],
+             signed, signed, parent["source_category"], line.get("category_id"), line["treatment"],
+             line.get("related_account_id"), (line.get("counterparty") or "").strip() or None,
+             parent["source_file"], parent["source_reference"], (line.get("notes") or "").strip() or None,
+             parent["import_batch_id"], f"split:{transaction_id}:{position}:{now}:{uuid.uuid4().hex[:8]}",
+             transaction_id, now, now, now))
+        ids.append(int(cursor.lastrowid))
+    connection.execute(
+        """UPDATE transactions SET category_id = NULL, treatment = 'Excluded', status = 'split',
+               counterparty = NULL, related_account_id = NULL, notes = ?, reviewed_at = ?, updated_at = ?
+           WHERE id = ?""", (f"Split into {count} lines", now, now, transaction_id))
+    _log_split(connection, parent, "edit split" if already else "split", before, [
+        {"amount": float(line["amount"]), "category_id": line.get("category_id"), "treatment": line["treatment"],
+         "counterparty": line.get("counterparty") or "", "notes": line.get("notes") or ""} for line in lines])
+    return ids
+
+
+def _original_state(connection: sqlite3.Connection, parent_id: int) -> dict[str, Any]:
+    import json
+    row = connection.execute(
+        """SELECT before_json FROM transaction_split_log WHERE parent_id = ? AND before_json IS NOT NULL
+           ORDER BY id LIMIT 1""", (parent_id,)).fetchone()
+    return json.loads(row["before_json"]) if row else {
+        "category_id": None, "treatment": "Needs review", "status": "needs_review", "counterparty": None,
+        "notes": None, "related_account_id": None, "learned_rule_id": None, "reviewed_at": None}
+
+
+def revert_split(connection: sqlite3.Connection, *, business_id: int, transaction_id: int) -> int:
+    """Remove the lines of a split and put the original transaction back as it was before splitting."""
+    parent = connection.execute(
+        "SELECT * FROM transactions WHERE id = ? AND business_id = ? AND status = 'split'",
+        (transaction_id, business_id)).fetchone()
+    if parent is None:
+        raise ValueError("That transaction is not split.")
+    before = _original_state(connection, transaction_id)
+    children = _split_children(connection, transaction_id)
+    child_ids = [int(c["id"]) for c in children]
+    if child_ids:
+        marks = ",".join("?" for _ in child_ids)
+        connection.execute(
+            f"UPDATE check_register SET transaction_id = ? WHERE transaction_id IN ({marks})", [transaction_id, *child_ids])
+        connection.execute(f"DELETE FROM transactions WHERE id IN ({marks})", child_ids)
+    connection.execute(
+        """UPDATE transactions SET category_id = ?, treatment = ?, status = ?, counterparty = ?, notes = ?,
+               related_account_id = ?, learned_rule_id = ?, reviewed_at = ?, updated_at = ? WHERE id = ?""",
+        (before["category_id"], before["treatment"], before["status"], before["counterparty"], before["notes"],
+         before["related_account_id"], before["learned_rule_id"], before["reviewed_at"], utc_now(), transaction_id))
+    _log_split(connection, parent, "revert", None, [])
+    return len(child_ids)
+
+
+def list_split_log(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
+    import json
+    rows = []
+    for row in connection.execute(
+        """SELECT l.*, (SELECT status FROM transactions t WHERE t.id = l.parent_id) AS current_status
+           FROM transaction_split_log l WHERE l.business_id = ? ORDER BY l.id DESC""", (business_id,)):
+        item = dict(row)
+        lines = json.loads(item.pop("lines_json") or "[]")
+        item.pop("before_json", None)
+        item["lines"] = len(lines)
+        item["detail"] = "; ".join(
+            f"${line['amount']:,.2f} {line['treatment']}" + (f" · {line['counterparty']}" if line.get("counterparty") else "")
+            for line in lines)
+        rows.append(item)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Attachments: invoices, receipts and check images kept with a transaction
+# ---------------------------------------------------------------------------
+
+ATTACHMENT_TYPES = {"pdf": "application/pdf", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
+MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024
+
+
+def add_attachment(connection: sqlite3.Connection, *, business_id: int, transaction_id: int,
+                   file_name: str, data: bytes) -> int:
+    """Keep a file with a transaction while it is being reviewed. It is temporary: clear_attachments removes it on save."""
+    if not connection.execute("SELECT 1 FROM transactions WHERE id = ? AND business_id = ?",
+                              (transaction_id, business_id)).fetchone():
+        raise ValueError("Transaction not found.")
+    extension = Path(file_name).suffix.lower().lstrip(".")
+    if extension not in ATTACHMENT_TYPES:
+        raise ValueError("Attach a PDF, PNG or JPG file.")
+    if not data:
+        raise ValueError("That file is empty.")
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise ValueError("That file is larger than 15 MB.")
+    clean = Path(file_name).name[:150]
+    duplicate = connection.execute(
+        "SELECT id FROM transaction_attachments WHERE transaction_id = ? AND file_name = ? AND size = ?",
+        (transaction_id, clean, len(data))).fetchone()
+    if duplicate:
+        return int(duplicate["id"])
+    cursor = connection.execute(
+        """INSERT INTO transaction_attachments(business_id, transaction_id, file_name, content_type, size, data, uploaded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (business_id, transaction_id, clean, ATTACHMENT_TYPES[extension], len(data), data, utc_now()))
+    return int(cursor.lastrowid)
+
+
+def list_attachments(connection: sqlite3.Connection, business_id: int, transaction_id: int) -> list[dict[str, Any]]:
+    return [dict(row) for row in connection.execute(
+        """SELECT id, file_name, content_type, size, uploaded_at FROM transaction_attachments
+           WHERE business_id = ? AND transaction_id = ? ORDER BY id""", (business_id, transaction_id))]
+
+
+def get_attachment_data(connection: sqlite3.Connection, business_id: int, attachment_id: int) -> bytes | None:
+    row = connection.execute("SELECT data FROM transaction_attachments WHERE id = ? AND business_id = ?",
+                             (attachment_id, business_id)).fetchone()
+    return bytes(row["data"]) if row else None
+
+
+def delete_attachment(connection: sqlite3.Connection, business_id: int, attachment_id: int) -> bool:
+    return connection.execute("DELETE FROM transaction_attachments WHERE id = ? AND business_id = ?",
+                              (attachment_id, business_id)).rowcount > 0
+
+
+def clear_attachments(connection: sqlite3.Connection, business_id: int, transaction_id: int) -> int:
+    """Remove the temporary documents of a transaction once its decision is saved."""
+    return connection.execute("DELETE FROM transaction_attachments WHERE business_id = ? AND transaction_id = ?",
+                              (business_id, transaction_id)).rowcount

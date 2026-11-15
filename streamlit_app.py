@@ -11,7 +11,8 @@ import hmac
 import pandas as pd
 import streamlit as st
 
-from books import ai_config, backup, db, exporter, importers, statements
+from books import ai_config, backup, db, documents, exporter, importers, statements
+from books import staff as staff_mod
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -81,7 +82,7 @@ st.markdown("""
   button[data-testid="stExpandSidebarButton"] span {color:#fff !important;}
   body:has([data-testid="stSidebarCollapseButton"] button[aria-expanded="true"])
     button[data-testid="stExpandSidebarButton"] {display:none !important;}
-  [data-testid="stMainBlockContainer"] {max-width: 1480px; padding: 2.25rem 3rem 4rem;}
+  [data-testid="stMainBlockContainer"] {max-width: 2000px; padding: 2.25rem 2rem 4rem;}
   [data-testid="stSidebar"] {background: linear-gradient(180deg, #0d3a5c 0%, #0b3150 62%, #12141d 100%); border-right: 0;}
   [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap: .72rem;}
   [data-testid="stSidebar"] label, [data-testid="stSidebar"] p, [data-testid="stSidebar"] span {color: #dce7ef;}
@@ -91,6 +92,20 @@ st.markdown("""
   [data-testid="stSidebar"] [role="radiogroup"] label:hover {background: rgba(255,255,255,.08);}
   [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {background: rgba(255,255,255,.14); box-shadow: inset 3px 0 0 #f0b73f;}
   [data-testid="stSidebar"] [data-baseweb="select"] > div {background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.15);}
+  [data-testid="stSidebar"] [data-testid="stExpander"] {border:0; background:transparent;}
+  [data-testid="stSidebar"] [data-testid="stExpander"] summary {padding:.35rem .4rem; background:transparent !important;}
+  [data-testid="stSidebar"] [data-testid="stExpander"] summary span, [data-testid="stSidebar"] [data-testid="stExpander"] summary svg {color:#9fc3dc !important;}
+  [data-testid="stSidebar"] [data-testid="stExpander"] summary p {font-size:.72rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:#9fc3dc;}
+  [data-testid="stSidebar"] [data-testid="stExpander"] [data-testid="stVerticalBlock"] {gap:.15rem;}
+  [data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"], [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {
+    justify-content:flex-start; border:0; border-radius:10px; padding:.55rem .85rem; text-align:left;}
+  [data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"] > div, [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] > div {justify-content:flex-start !important; width:100%;}
+  [data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"] p, [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] p {text-align:left !important; width:100%;}
+  [data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"] {background:transparent !important;}
+  [data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"] p {color:#dce7ef;}
+  [data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"]:hover {background:rgba(255,255,255,.08) !important;}
+  [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {background:rgba(255,255,255,.14) !important; box-shadow:inset 3px 0 0 #f0b73f !important;}
+  [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] p {color:#fff; font-weight:650;}
   [data-testid="stSidebar"] hr {border-color: rgba(255,255,255,.12);}
   .brand {padding: .45rem .2rem 1.15rem; display:flex; align-items:center; gap:.8rem;}
   .brand-logo {background:#fff; border-radius:12px; padding:.55rem .8rem; box-shadow:0 8px 24px rgba(0,0,0,.22); display:flex; align-items:center;}
@@ -229,6 +244,114 @@ def render_loan_balances(loan_rows: list[dict], show_business: bool = False) -> 
                 "Excess": abs(min(r["owed_to_us"], r["we_owe"]))} for r in odd]),
                 hide_index=True, width="stretch",
                 column_config={"Excess": st.column_config.NumberColumn(format="$%.2f")})
+
+
+def add_from_to(frame: pd.DataFrame, *, amount_col: str | None, direction_col: str | None, account_col: str,
+                party_col: str, business: str) -> pd.DataFrame:
+    """Add From / To columns: money in comes from the party into us, money out goes from us to the party."""
+    frame = frame.copy()
+    if direction_col:
+        money_in = frame[direction_col].astype(str).str.lower().str.startswith("deposit")
+    else:
+        money_in = frame[amount_col].astype(float) >= 0
+    us = frame[account_col].map(lambda account: f"{business} · {account}")
+    party = frame[party_col].fillna("").replace("", "(not set)")
+    frame["From"] = party.where(money_in, us)
+    frame["To"] = us.where(money_in, party)
+    return frame
+
+
+def render_document_preview(key: str, business_id: int, current_id: int | None = None, jump=None):
+    """One temporary upload box: look at an invoice, receipt or check while you update the transaction.
+
+    Nothing is stored. Files stay in the upload box until you save, then that file is hidden.
+    Returns (parsed details or None, file identity) for the file being viewed.
+    """
+    import base64
+    import streamlit.components.v1 as components
+    counter = st.session_state.get(f"doc_counter_{key}", 0)
+    done = st.session_state.setdefault(f"doc_done_{key}", set())
+    uploads = st.file_uploader(
+        "Upload a PDF or image to view while you update (not stored)", type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True, key=f"doc_up_{key}_{counter}",
+        help="Preview only. The file is not saved to your books and is forgotten when you save the decision.")
+    waiting = [u for u in uploads or [] if (u.name, u.size) not in done]
+    if not waiting:
+        if uploads:
+            st.caption("All uploaded files have been used. Upload more, or remove them above.")
+        return None, None
+    names = [u.name for u in waiting]
+    chosen = waiting[0]
+    if len(waiting) > 1:
+        picked = st.selectbox(f"Viewing ({len(waiting)} files waiting)", names, key=f"doc_view_{key}_{counter}")
+        chosen = waiting[names.index(picked)]
+    data = chosen.getvalue()
+    parsed = None
+    if chosen.name.lower().endswith(".pdf"):
+        parsed = parse_pdf_cached(data)
+        encoded = base64.b64encode(data).decode()
+        components.html(
+            "<iframe id='f' style='width:100%;height:560px;border:1px solid #dde4ea;border-radius:10px'></iframe>"
+            "<script>const b=Uint8Array.from(atob('" + encoded + "'),c=>c.charCodeAt(0));"
+            "document.getElementById('f').src=URL.createObjectURL(new Blob([b],{type:'application/pdf'}));</script>",
+            height=580)
+        st.download_button("Open or download this PDF", data=data, file_name=chosen.name, mime="application/pdf",
+                           key=f"doc_dl_{key}_{counter}_{chosen.name}")
+        if parsed["has_text"]:
+            with st.expander("Text read from the PDF"):
+                st.text(documents.extract_text(data)[:3000])
+            if jump is not None and parsed["total"]:
+                with db.connect(DB_PATH) as connection:
+                    candidates = [c for c in documents.match_candidates(connection, business_id, parsed)
+                                  if c["score"] >= 5]
+                best = candidates[0] if candidates else None
+                if best and best["id"] != current_id:
+                    st.info(f"This looks like transaction #{best['id']} · {best['transaction_date']} · "
+                            f"{money(float(best['signed_amount']))} · {best['description'][:50]} ({best['why']}).")
+                    jump(best)
+                elif best:
+                    st.caption("This document matches the transaction you are reviewing.")
+        else:
+            st.caption("This PDF has no readable text (a scan), so details can't be read from it. Use the preview.")
+    else:
+        st.image(data, width="stretch")
+    return (parsed if parsed and parsed["has_text"] else None), (chosen.name, chosen.size)
+
+
+def finish_document(key: str, ident) -> None:
+    """Forget the file that was just used; when every file is used, reset the upload box."""
+    if ident is None:
+        return
+    done = st.session_state.setdefault(f"doc_done_{key}", set())
+    done.add(ident)
+
+
+@st.cache_data(show_spinner=False, max_entries=200)
+def parse_pdf_cached(data: bytes) -> dict:
+    return documents.parse_document(documents.extract_text(data))
+
+
+def apply_pdf_details(vendor_key: str, notes_key: str, vendor: str, note: str) -> None:
+    if vendor:
+        st.session_state[vendor_key] = vendor
+    if note:
+        st.session_state[notes_key] = note
+
+
+def shift_staff_month(step: int) -> None:
+    """Move the Staff & payroll month forward (+1) or back (-1) one month. Runs as a button callback."""
+    options = staff_mod.recent_months(30)  # newest first
+    current = st.session_state.get("staff_month")
+    if current in options:
+        st.session_state["staff_month"] = options[min(max(options.index(current) - step, 0), len(options) - 1)]
+
+
+def rerun_dialog() -> None:
+    """Refresh just the open dialog; fall back to a full rerun where fragments are not available."""
+    try:
+        st.rerun(scope="fragment")
+    except st.errors.StreamlitAPIException:
+        st.rerun()
 
 
 def go_to(label: str) -> None:
@@ -447,24 +570,45 @@ def render_personal_tax_prep() -> None:
 with db.connect(DB_PATH) as connection:
     businesses = db.list_businesses(connection)
 
-st.sidebar.markdown(
-    (f'<div class="brand"><div class="brand-logo"><img src="data:image/png;base64,{LOGO_B64}" alt="Rovar Infotech"/></div></div>'
-     if LOGO_B64 else '<div class="brand"><div class="brand-mark">R</div></div>')
-    + '<div class="brand-sub" style="margin:-.5rem 0 .9rem .2rem">Ledgerly · Business books</div>', unsafe_allow_html=True)
+st.sidebar.markdown('<div class="brand-sub" style="margin:.2rem 0 .6rem .2rem">Ledgerly · Business books</div>',
+                    unsafe_allow_html=True)
+business_by_name = {item["name"]: item for item in businesses}
+business_names = list(business_by_name)
+if businesses:
+    with db.connect(DB_PATH) as connection:
+        default_business_id = db.get_setting(connection, "default_business_id", "")
+    default_business_index = next(
+        (index for index, name in enumerate(business_names)
+         if str(business_by_name[name]["id"]) == default_business_id), 0)
+    business_name = st.sidebar.selectbox("Business", business_names, index=default_business_index)
+    business_id = int(business_by_name[business_name]["id"])
 nav = {
     "▦  Dashboard": "Dashboard", "↗  Revenue & expense": "Revenue & Expense",
     "▣  Tax prep": "Tax Prep", "♙  Personal tax prep": "Personal Tax Prep",
     "⇧  Import transactions": "Import / Paste",
     "▤  Statements & checks": "Statements & Checks",
     "＄  Deposits": "Deposits", "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
-    "▥  Reports": "Reports", "☷  Parties": "Parties", "⌁  Categories & rules": "Categories & Rules",
+    "▥  Reports": "Reports", "☻  Staff & payroll": "Staff & Payroll", "☷  Parties": "Parties", "⌁  Categories & rules": "Categories & Rules",
     "◇  Accounts & credit": "Accounts & Credit",
     "⚙  Manage business": "Manage Business", "↓  Export & settings": "Export & Settings",
     "🛡  Admin & backup": "Admin & Backup",
 }
 if st.session_state.get("nav_choice") not in nav:
     st.session_state["nav_choice"] = "▦  Dashboard"
-nav_choice = st.sidebar.radio("Navigation", list(nav), label_visibility="collapsed", key="nav_choice")
+NAV_GROUPS = {
+    "Overview": ["▦  Dashboard", "↗  Revenue & expense", "▥  Reports"],
+    "Bookkeeping": ["⇧  Import transactions", "▤  Statements & checks", "＄  Deposits", "✓  Review queue",
+                    "≡  All transactions"],
+    "People & payroll": ["☻  Staff & payroll", "☷  Parties", "⌁  Categories & rules"],
+    "Tax": ["▣  Tax prep", "♙  Personal tax prep"],
+    "Setup": ["◇  Accounts & credit", "⚙  Manage business", "↓  Export & settings", "🛡  Admin & backup"],
+}
+nav_choice = st.session_state["nav_choice"]
+for group_name, group_items in NAV_GROUPS.items():
+    with st.sidebar.expander(group_name, expanded=nav_choice in group_items):
+        for item in group_items:
+            st.button(item, key=f"nav_btn_{item}", width="stretch", on_click=go_to, args=(item,),
+                      type="primary" if item == nav_choice else "tertiary")
 page = nav[nav_choice]
 
 def render_admin() -> None:
@@ -543,6 +687,40 @@ def render_admin() -> None:
         except ValueError as exc:
             st.error(str(exc))
             temp.unlink(missing_ok=True)
+
+    section_label("Copy categories and party rules between businesses")
+    st.caption("Each business keeps its own categories and party bank-text rules. Use this to start one business "
+               "from another's setup. Copies are one-way and never overwrite: names that already exist are skipped.")
+    if len(businesses) < 2:
+        st.caption("Create a second business to copy between them.")
+    else:
+        names = [item["name"] for item in businesses]
+        by_name = {item["name"]: int(item["id"]) for item in businesses}
+        c1, c2 = st.columns(2)
+        source_name = c1.selectbox("Copy from", names, key="copy_source")
+        target_name = c2.selectbox("Copy to", [n for n in names if n != source_name], key="copy_target")
+        with db.connect(DB_PATH) as connection:
+            source_categories = db.list_categories(connection, by_name[source_name])
+            source_vendors = connection.execute(
+                "SELECT id, name, match_pattern FROM vendors WHERE business_id = ? ORDER BY name",
+                (by_name[source_name],)).fetchall()
+        chosen_categories = st.multiselect(
+            f"Categories to copy ({len(source_categories)} in {source_name})", [c["name"] for c in source_categories],
+            default=[c["name"] for c in source_categories], key=f"copy_cats_{source_name}")
+        vendor_labels = {f"{v['name']} — {v['match_pattern']}": int(v["id"]) for v in source_vendors}
+        chosen_vendors = st.multiselect(
+            f"Party bank-text rules to copy ({len(source_vendors)} in {source_name})", list(vendor_labels),
+            default=list(vendor_labels), key=f"copy_vendors_{source_name}",
+            help="Copying a rule also copies the category it uses if the target doesn't have it yet.")
+        if st.button(f"Copy to {target_name}", type="primary", disabled=not (chosen_categories or chosen_vendors)):
+            backup.create_backup(DB_PATH, "pre-copy")
+            with db.connect(DB_PATH) as connection:
+                cat_result = db.copy_categories(connection, by_name[source_name], by_name[target_name], chosen_categories)
+                rule_result = db.copy_bank_text_rules(connection, by_name[source_name], by_name[target_name],
+                                                      [vendor_labels[label] for label in chosen_vendors])
+            st.success(f"Categories: {cat_result['copied']} copied, {cat_result['skipped']} already there. "
+                       f"Party rules: {rule_result['copied']} copied, {rule_result['skipped']} already there. "
+                       "A backup was taken first.")
 
 
 @st.dialog("Restore this backup?")
@@ -680,15 +858,6 @@ if not businesses:
             rerun()
     st.stop()
 
-business_by_name = {item["name"]: item for item in businesses}
-business_names = list(business_by_name)
-with db.connect(DB_PATH) as connection:
-    default_business_id = db.get_setting(connection, "default_business_id", "")
-default_business_index = next(
-    (index for index, name in enumerate(business_names)
-     if str(business_by_name[name]["id"]) == default_business_id), 0)
-business_name = st.sidebar.selectbox("Business", business_names, index=default_business_index)
-business_id = int(business_by_name[business_name]["id"])
 st.sidebar.caption("Your records remain on this machine.")
 
 with st.sidebar.expander("Add another business"):
@@ -745,18 +914,14 @@ if page == "Dashboard":
     dash_ids = [int(b["id"]) for b in businesses] if all_businesses else [business_id]
     business_name_by_id = {int(b["id"]): b["name"] for b in businesses}
     dash_loans, dash_vendors = [], []
+    dash_loan_problems = 0
     with db.connect(DB_PATH) as connection:
         for dash_id in dash_ids:
             for row in db.loan_report(connection, dash_id):
                 dash_loans.append({"business": business_name_by_id[dash_id], **row})
             for row in db.vendor_report(connection, dash_id):
                 dash_vendors.append({"Business": business_name_by_id[dash_id], **row})
-    section_label("Loans")
-    if dash_loans:
-        render_loan_balances(dash_loans, show_business=all_businesses)
-        st.button("▥  Open loan reports", on_click=go_to, args=("▥  Reports",), key="dash_to_loans")
-    else:
-        st.caption("No loan activity recorded yet.")
+            dash_loan_problems += len(db.loan_direction_problems(connection, dash_id))
     section_label("Revenue and expense by vendor")
     if dash_vendors:
         vendor_dash = pd.DataFrame(dash_vendors).rename(columns={
@@ -768,21 +933,34 @@ if page == "Dashboard":
                 Transactions=("Transactions", "sum"), **{"Last activity": ("Last activity", "max")})
         else:
             vendor_dash = vendor_dash.drop(columns=["Business"])
-        top_n = st.slider("Vendors to show", 5, 25, 10, key="dash_vendor_count")
-        left, right = st.columns(2)
-        with left:
-            st.markdown("**Top revenue sources**")
-            top_rev = vendor_dash[vendor_dash["Revenue"] > 0].sort_values("Revenue", ascending=False).head(top_n)
-            st.dataframe(top_rev[["Vendor / party", "Revenue", "Transactions"]], hide_index=True, width="stretch",
-                         column_config={"Revenue": st.column_config.NumberColumn(format="$%.2f")})
-        with right:
-            st.markdown("**Top expenses**")
-            top_exp = vendor_dash[vendor_dash["Expense"] > 0].sort_values("Expense", ascending=False).head(top_n)
-            st.dataframe(top_exp[["Vendor / party", "Expense", "Transactions"]], hide_index=True, width="stretch",
-                         column_config={"Expense": st.column_config.NumberColumn(format="$%.2f")})
+        top_n = st.slider("Vendors to show", 5, 100, 25, key="dash_vendor_count_25")
+        for title, column in (("Revenue by vendor", "Revenue"), ("Expense by vendor", "Expense")):
+            ranked = vendor_dash[vendor_dash[column] > 0].sort_values(column, ascending=False)
+            shown = ranked.head(top_n)
+            st.markdown(f"**{title}** · top {len(shown)} of {len(ranked)} · total {money(float(ranked[column].sum()))}"
+                        f" · shown {money(float(shown[column].sum()))}")
+            if shown.empty:
+                st.caption(f"No {column.lower()} recorded yet.")
+            else:
+                st.dataframe(shown[["Vendor / party", column, "Transactions", "Last activity"]], hide_index=True, width="stretch",
+                             height=min(35 * (len(shown) + 1) + 3, 940),
+                             column_config={column: st.column_config.NumberColumn(format="$%.2f")})
         st.button("▥  Open vendor report", on_click=go_to, args=("▥  Reports",), key="dash_to_vendor")
     else:
         st.caption("No revenue or expense recorded yet.")
+    section_label("Loans")
+    if dash_loan_problems:
+        w1, w2 = st.columns([4, 1])
+        w1.warning(f"{dash_loan_problems} loan entr{'y is' if dash_loan_problems == 1 else 'ies are'} filed the wrong way "
+                   "(for example money received marked as repaid by us, or the owner's own money filed as a loan), "
+                   "so the balances below are not right yet.")
+        w2.button("Fix them", on_click=go_to, args=("▥  Reports",), key="dash_fix_loans", type="primary",
+                  help="Opens Reports. On the Loans tab, tick the fixes and press Apply.")
+    if dash_loans:
+        render_loan_balances(dash_loans, show_business=all_businesses)
+        st.button("▥  Open loan reports", on_click=go_to, args=("▥  Reports",), key="dash_to_loans")
+    else:
+        st.caption("No loan activity recorded yet.")
 
 
 elif page == "Revenue & Expense":
@@ -925,7 +1103,7 @@ elif page == "Tax Prep":
     uncategorized_frame = year_frame[
         year_frame["category"].isna() & year_frame["treatment"].isin(["Revenue", "Revenue refund", "Expense", "Expense refund"])
     ].copy()
-    excluded_frame = year_frame[year_frame["treatment"].isin(["Transfer", "Loan draw", "Principal repayment", "Loan receivable", "Receivable repayment", "Excluded"])]
+    excluded_frame = year_frame[year_frame["treatment"].isin(["Transfer", "Loan draw", "Principal repayment", "Loan receivable", "Receivable repayment", "Owner contribution", "Owner draw", "Excluded"])]
     t1, t2, t3, t4 = st.columns(4)
     with t1: metric_card("Gross revenue", money(tax_revenue), f"Tax year {tax_year}", "↗", "teal")
     with t2: metric_card("Recorded expenses", money(tax_expense), "Not a deductibility opinion", "↘", "rose")
@@ -1316,7 +1494,7 @@ elif page == "Statements & Checks":
                         "Category", category_options, key=category_key,
                         on_change=sync_category_treatment,
                         args=(category_key, treatment_key, category_defaults),
-                        help="Selecting Loan automatically chooses Loan draw; Loan repayment chooses Principal repayment. For money you lend out, pick the Loan receivable treatment; when it is repaid, Receivable repayment.")
+                        help="Selecting Loan chooses Loan receivable (money you lend out). Change the treatment if this is money you borrowed.")
                     treatment_options = list(db.TREATMENTS)
                     treatment = st.selectbox("Treatment", treatment_options, key=treatment_key)
                     counterparty_label = {
@@ -1357,7 +1535,9 @@ elif page == "Statements & Checks":
                                 (index + 1 for index, item in enumerate(candidates) if item.get("number_match")),
                                 candidate_index)
                         transaction_label = st.selectbox("Existing transaction match", candidate_labels, index=candidate_index)
-                        payee = st.text_input(counterparty_label, key=payee_key,
+                        st.text_input("From (us)", value=f"{business_name} · {selected_account_name}", disabled=True,
+                                      key=f"check_from_{active_image_name}_{chosen['check_number']}")
+                        payee = st.text_input(f"To · {counterparty_label}", key=payee_key,
                                               placeholder="Read from the check image")
                         memo = st.text_input("Memo / purpose", key=memo_key, placeholder="Optional")
                         saved_written_date = (existing.get("written_date") if existing else None) or chosen["cleared_date"]
@@ -1438,36 +1618,88 @@ elif page == "Statements & Checks":
             deposit_files = st.file_uploader(
                 "Images of the deposited checks (PDF, PNG or JPG)", type=["pdf", "png", "jpg", "jpeg"],
                 accept_multiple_files=True, key=f"deposit_files_{deposit_id}")
+            pictures_all: list[tuple[str, str, bytes]] = []
             for uploaded in deposit_files or []:
-                st.caption(uploaded.name)
                 if uploaded.name.lower().endswith(".pdf"):
-                    pictures = statements.extract_check_images(uploaded.getvalue())[:2]
+                    found = statements.extract_check_images(uploaded.getvalue())[:6]
+                    if not found:
+                        st.info(f"No check image was found in {uploaded.name}.")
                 else:
-                    pictures = [uploaded.getvalue()]
-                if not pictures:
-                    st.info("No check image was found in that PDF.")
-                for index, picture in enumerate(pictures):
-                    st.image(picture, caption="Front" if index == 0 else "Back", width="stretch")
+                    found = [uploaded.getvalue()]
+                for index, picture in enumerate(found):
+                    pictures_all.append((uploaded.name, "Front" if index == 0 else "Back" if index == 1 else f"Page {index + 1}",
+                                         picture))
+            if pictures_all:
+                pos_key = f"deposit_image_pos_{deposit_id}"
+                position = min(int(st.session_state.get(pos_key, 0)), len(pictures_all) - 1)
+                nav_prev, nav_label, nav_next = st.columns([1, 2.2, 1])
+                if nav_prev.button("◀ Previous", key=f"deposit_prev_{deposit_id}", width="stretch", disabled=position <= 0):
+                    st.session_state[pos_key] = position - 1
+                    rerun()
+                if nav_next.button("Next ▶", key=f"deposit_next_{deposit_id}", width="stretch",
+                                   disabled=position >= len(pictures_all) - 1):
+                    st.session_state[pos_key] = position + 1
+                    rerun()
+                nav_label.markdown(f"<div style='text-align:center;padding-top:0.4rem'>Image {position + 1} of {len(pictures_all)}</div>",
+                                   unsafe_allow_html=True)
+                labels = [f"{i + 1}. {name} · {side}" for i, (name, side, _) in enumerate(pictures_all)]
+                jump = st.selectbox("Jump to image", labels, index=position, key=f"deposit_jump_{deposit_id}_{position}",
+                                    label_visibility="collapsed")
+                if labels.index(jump) != position:
+                    st.session_state[pos_key] = labels.index(jump)
+                    rerun()
+                shown_name, shown_side, shown_picture = pictures_all[position]
+                st.image(shown_picture, caption=f"{shown_name} · {shown_side}", width="stretch")
+                st.caption("Enter this check on the table row whose Image file is " + shown_name + ".")
+            else:
+                st.caption("Add check images to look at them one at a time. Cash needs no image: add a row with Type = Cash.")
         with entry_column:
             st.markdown(f"#### Deposit of {money(float(deposit['signed_amount']))} on {deposit['transaction_date']}")
             seed_key = f"deposit_seed_{deposit_id}"
-            table_key = f"deposit_table_{deposit_id}_{st.session_state.get(seed_key, {}).get('version', 0)}"
             file_names = [item.name for item in deposit_files or []]
+            table_key = (f"deposit_table_{deposit_id}_{st.session_state.get(seed_key, {}).get('version', 0)}_"
+                         f"{abs(hash(tuple(file_names)))}")
             with db.connect(DB_PATH) as connection:
                 prefill = db.suggest_deposit_check_details(connection, business_id, deposit_id)
-            starter = pd.DataFrame([{
-                "Check #": prefill.get("check_number") or "", "Received from": prefill.get("payer") or "",
-                "Amount": float(deposit["signed_amount"]),
-                "Memo": prefill.get("memo") or "", "Image file": file_names[0] if file_names else ""}])
+            split_lines = []
+            if deposit.get("status") == "split":
+                with db.connect(DB_PATH) as connection:
+                    split_lines = db.get_split_lines(connection, deposit_id)
+            if split_lines:
+                starter = pd.DataFrame([{
+                    "Type": "Check", "Check #": "", "Received from": line["counterparty"] or "",
+                    "Amount": abs(float(line["signed_amount"])), "Memo": line["notes"] or "",
+                    "Image file": file_names[index] if index < len(file_names) else "",
+                    "Category": line["category"] or "Uncategorized", "Treatment": line["treatment"]}
+                    for index, line in enumerate(split_lines)])
+            elif len(file_names) > 1:
+                starter = pd.DataFrame([{
+                    "Type": "Check", "Check #": "", "Received from": "", "Amount": None, "Memo": "", "Image file": name}
+                    for name in dict.fromkeys(file_names)])
+            else:
+                starter = pd.DataFrame([{
+                    "Type": "Check", "Check #": prefill.get("check_number") or "", "Received from": prefill.get("payer") or "",
+                    "Amount": float(deposit["signed_amount"]),
+                    "Memo": prefill.get("memo") or "", "Image file": file_names[0] if file_names else ""}])
             seed = st.session_state.get(seed_key)
             if seed:
                 starter.loc[0, ["Check #", "Received from", "Memo"]] = [
                     seed.get("check_number") or "", seed["payer"], seed["memo"]]
-            if prefill:
+            if split_lines:
+                st.info("This deposit was split, so each row below is one line of the split with its own category and "
+                        "treatment. Add the check numbers and images; amounts must still add up to the deposit.")
+            elif prefill:
                 st.caption(f"Pre-filled from your records: {prefill['reason']}. Edit anything that is not right.")
+            st.caption(f"**From:** each check's payer  →  **To:** {business_name} · {selected_account_name}. "
+                       "Add a row (＋ at the bottom of the table) for each extra check, or set Type = Cash for cash.")
             edited = st.data_editor(
                 starter, key=table_key, num_rows="dynamic", hide_index=True, width="stretch",
                 column_config={
+                    "Type": st.column_config.SelectboxColumn(options=["Check", "Cash"], default="Check", required=True,
+                                                             help="Cash needs no check number or image."),
+                    "Received from": st.column_config.TextColumn("From (payer)"),
+                    "Category": st.column_config.SelectboxColumn(options=["Uncategorized"] + list(category_by_name)),
+                    "Treatment": st.column_config.SelectboxColumn(options=list(db.TREATMENTS[:-1])),
                     "Amount": st.column_config.NumberColumn(format="$%.2f", min_value=0.0, step=0.01),
                     "Image file": st.column_config.SelectboxColumn(options=[""] + file_names)})
             entered = edited.dropna(subset=["Amount"])
@@ -1480,39 +1712,45 @@ elif page == "Statements & Checks":
                            f"{money(abs(difference))} {'still to account for' if difference > 0 else 'too much'}.")
             d_category_key = f"deposit_category_{deposit_id}"
             d_treatment_key = f"deposit_treatment_{deposit_id}"
-            d_options = ["Uncategorized"] + list(category_by_name)
-            d_defaults = {"Uncategorized": "Revenue", **{
-                name: item["default_treatment"] for name, item in category_by_name.items()}}
-            st.session_state.setdefault(
-                d_category_key, prefill.get("category") if prefill.get("category") in category_by_name else "Uncategorized")
-            st.session_state.setdefault(
-                d_treatment_key, prefill.get("treatment") if prefill.get("treatment") in db.TREATMENTS else "Revenue")
-            st.selectbox("Category", d_options, key=d_category_key, on_change=sync_category_treatment,
-                         args=(d_category_key, d_treatment_key, d_defaults))
-            st.selectbox("Treatment", list(db.TREATMENTS), key=d_treatment_key,
-                         help="Revenue for customer payments. Use Receivable repayment when a loan you made is being repaid, "
-                              "or Loan draw if the money is a loan to you.")
-            chosen_treatment = st.session_state[d_treatment_key]
-            chosen_category = st.session_state[d_category_key]
-            if chosen_treatment != "Revenue" or chosen_category == "Internal transfer":
-                with db.connect(DB_PATH) as connection:
-                    last_details = (db.last_deposit_details(
-                        connection, business_id, treatment=chosen_treatment,
-                        category=chosen_category if chosen_category in category_by_name else None,
-                        exclude_transaction_id=deposit_id)
-                        or db.last_deposit_details(connection, business_id, treatment=chosen_treatment,
-                                                   exclude_transaction_id=deposit_id))
-                if last_details:
-                    with st.container(border=True):
-                        st.markdown(f"**Use details from the {last_details['reason']}?**")
-                        st.caption(f"Received from: {last_details['payer'] or '—'} · Memo: {last_details['memo'] or '—'}")
-                        if st.button("Fill the table with these details", key=f"deposit_fill_{deposit_id}"):
-                            st.session_state[seed_key] = {
-                                **last_details, "version": st.session_state.get(seed_key, {}).get("version", 0) + 1}
-                            rerun()
+            multi_checks = len(entered) >= 2 and not split_lines
+            if multi_checks:
+                st.warning(f"{len(entered)} checks on one deposit: when you confirm, the deposit is marked **Needs split** "
+                           "so each check can get its own category. Open it on All transactions and press ✂ Split…; "
+                           "the lines will be pre-filled from these checks.")
+            if not split_lines and not multi_checks:
+                d_options = ["Uncategorized"] + list(category_by_name)
+                d_defaults = {"Uncategorized": "Revenue", **{
+                    name: item["default_treatment"] for name, item in category_by_name.items()}}
+                st.session_state.setdefault(
+                    d_category_key, prefill.get("category") if prefill.get("category") in category_by_name else "Uncategorized")
+                st.session_state.setdefault(
+                    d_treatment_key, prefill.get("treatment") if prefill.get("treatment") in db.TREATMENTS else "Revenue")
+                st.selectbox("Category", d_options, key=d_category_key, on_change=sync_category_treatment,
+                             args=(d_category_key, d_treatment_key, d_defaults))
+                st.selectbox("Treatment", list(db.TREATMENTS), key=d_treatment_key,
+                             help="Revenue for customer payments. Use Receivable repayment when a loan you made is being repaid, "
+                                  "or Loan draw if the money is a loan to you.")
+                chosen_treatment = st.session_state[d_treatment_key]
+                chosen_category = st.session_state[d_category_key]
+                if chosen_treatment != "Revenue" or chosen_category == "Internal transfer":
+                    with db.connect(DB_PATH) as connection:
+                        last_details = (db.last_deposit_details(
+                            connection, business_id, treatment=chosen_treatment,
+                            category=chosen_category if chosen_category in category_by_name else None,
+                            exclude_transaction_id=deposit_id)
+                            or db.last_deposit_details(connection, business_id, treatment=chosen_treatment,
+                                                       exclude_transaction_id=deposit_id))
+                    if last_details:
+                        with st.container(border=True):
+                            st.markdown(f"**Use details from the {last_details['reason']}?**")
+                            st.caption(f"Received from: {last_details['payer'] or '—'} · Memo: {last_details['memo'] or '—'}")
+                            if st.button("Fill the table with these details", key=f"deposit_fill_{deposit_id}"):
+                                st.session_state[seed_key] = {
+                                    **last_details, "version": st.session_state.get(seed_key, {}).get("version", 0) + 1}
+                                rerun()
             if st.button("Confirm deposited checks", type="primary", width="stretch",
                          disabled=abs(difference) >= 0.005 or not len(entered), key=f"deposit_confirm_{deposit_id}"):
-                d_category = st.session_state[d_category_key]
+                d_category = "Uncategorized" if multi_checks else st.session_state.get(d_category_key, "Uncategorized")
                 with db.connect(DB_PATH) as connection:
                     try:
                         db.confirm_deposit_checks(
@@ -1520,13 +1758,22 @@ elif page == "Statements & Checks":
                             transaction_id=deposit_id, bank_name=deposit_account.get("institution") or "",
                             account_last4=deposit_account.get("last4") or "",
                             deposited_checks=[{
-                                "check_number": str(row["Check #"] or ""), "payer": str(row["Received from"] or ""),
-                                "amount": float(row["Amount"]), "memo": str(row["Memo"] or ""),
-                                "image_file": str(row["Image file"] or "")}
-                                for _, row in entered.iterrows()],
+                                "check_number": (f"CASH-{deposit_id}-{number}" if str(row.get("Type") or "") == "Cash"
+                                                 else str(row["Check #"] or "")),
+                                "payer": str(row["Received from"] or ""),
+                                "amount": float(row["Amount"]),
+                                "memo": str(row["Memo"] or "") or ("Cash deposit" if str(row.get("Type") or "") == "Cash" else ""),
+                                "image_file": "" if str(row.get("Type") or "") == "Cash" else str(row["Image file"] or ""),
+                                **({"category_id": (int(category_by_name[row["Category"]]["id"])
+                                                    if row.get("Category") in category_by_name else None),
+                                    "treatment": row.get("Treatment") or "Revenue"} if split_lines else {})}
+                                for number, (_, row) in enumerate(entered.iterrows(), start=1)],
                             category_id=(int(category_by_name[d_category]["id"]) if d_category in category_by_name else None),
-                            treatment=st.session_state[d_treatment_key])
-                        st.session_state["deposit_message"] = f"Deposit #{deposit_id} reconciled with {len(entered)} check(s)."
+                            treatment=None if multi_checks else st.session_state.get(d_treatment_key, "Revenue"),
+                            needs_split=multi_checks)
+                        st.session_state["deposit_message"] = (
+                            f"Deposit #{deposit_id} reconciled with {len(entered)} check(s)."
+                            + (" It is marked Needs split: open it on All transactions and press ✂ Split…." if multi_checks else ""))
                     except ValueError as exc:
                         st.error(str(exc))
                         st.stop()
@@ -1568,7 +1815,9 @@ elif page == "Statements & Checks":
                 "Deposit total": st.column_config.NumberColumn(format="$%.2f")})
             st.download_button(
                 "Download log with every check (CSV)", type="primary",
-                data=pd.DataFrame(shown_log_rows).to_csv(index=False).encode("utf-8"),
+                data=(add_from_to(pd.DataFrame(shown_log_rows), amount_col=None, direction_col="direction",
+                                  account_col="account", party_col="counterparty", business=business_name)
+                      if shown_log_rows else pd.DataFrame(shown_log_rows)).to_csv(index=False).encode("utf-8"),
                 file_name=f"{db.slugify(business_name)}-statement-reconciliation-log.csv", mime="text/csv",
                 help="One row per check and deposited check for the statements shown above, ready to archive next to the statement.")
         else:
@@ -1579,14 +1828,19 @@ elif page == "Statements & Checks":
     section_label("Confirmed check register")
     with db.connect(DB_PATH) as connection:
         register = db.list_check_register(connection, business_id)
+    for entry in register:
+        entry["split_state"] = ("Split" if entry.get("transaction_status") == "split"
+                                else "Needs split" if int(entry.get("lines_on_transaction") or 0) >= 2 else "")
     total_register = len(register)
     if register:
-        rf1, rf2, rf3, rf4, rf5 = st.columns([1.5, 1, 1, 1, 1])
+        rf1, rf2, rf3, rf4, rf5, rf6 = st.columns([1.5, 1, 1, 1, 1, 1])
         reg_search = rf1.text_input("Search checks", key="reg_search", placeholder="Check #, payee, memo, amount…")
         reg_account = rf2.selectbox("Account", ["All accounts"] + sorted({r["account"] for r in register}), key="reg_account")
         reg_dir = rf3.selectbox("Direction", ["All", "Payments", "Deposits"], key="reg_dir")
         reg_treat = rf4.selectbox("Treatment", ["All"] + sorted({r["treatment"] for r in register if r["treatment"]}), key="reg_treat")
         reg_year = rf5.selectbox("Year", ["All"] + sorted({str(r["cleared_date"])[:4] for r in register}, reverse=True), key="reg_year")
+        reg_split = rf6.selectbox("Split", ["All", "Needs split", "Split"], key="reg_split",
+                                  help="Needs split: the bank transaction has 2 or more lines in the register and isn't split yet.")
         needle = reg_search.strip().lower().replace(",", "").replace("$", "")
         def reg_match(r: dict) -> bool:
             hay = " ".join(str(r.get(k) or "") for k in (
@@ -1596,9 +1850,10 @@ elif page == "Statements & Checks":
                     and (reg_account == "All accounts" or r["account"] == reg_account)
                     and (reg_dir == "All" or r["check_type"] == ("payment" if reg_dir == "Payments" else "deposit"))
                     and (reg_treat == "All" or r["treatment"] == reg_treat)
-                    and (reg_year == "All" or str(r["cleared_date"]).startswith(reg_year)))
+                    and (reg_year == "All" or str(r["cleared_date"]).startswith(reg_year))
+                    and (reg_split == "All" or r["split_state"] == reg_split))
         register = [r for r in register if reg_match(r)]
-        grid_key = f"check_register_grid_{abs(hash((reg_search, reg_account, reg_dir, reg_treat, reg_year)))}"
+        grid_key = f"check_register_grid_{abs(hash((reg_search, reg_account, reg_dir, reg_treat, reg_year, reg_split)))}"
         st.caption(f"Showing {len(register):,} of {total_register:,} checks · {money(sum(float(r['amount']) for r in register))}")
     if register:
         register_frame = pd.DataFrame(register).rename(columns={
@@ -1606,7 +1861,7 @@ elif page == "Statements & Checks":
             "amount": "Amount", "payee": "Counterparty", "memo": "Memo", "bank_name": "Bank",
             "account": "Account", "category": "Category", "treatment": "Treatment",
             "check_type": "Direction",
-            "transaction_id": "Transaction #", "source_file_name": "Source file"})
+            "transaction_id": "Transaction #", "source_file_name": "Source file", "split_state": "Split"})
         register_frame["Direction"] = register_frame["Direction"].map({
             "payment": "Payment / money paid", "deposit": "Deposit / money received"}).fillna(register_frame["Direction"])
         @st.dialog("Delete check register entry?")
@@ -1635,9 +1890,11 @@ elif page == "Statements & Checks":
                 st.rerun()
 
         st.caption("Select a row in the grid to delete it.")
+        register_frame = add_from_to(register_frame, amount_col=None, direction_col="Direction", account_col="Account",
+                                     party_col="Counterparty", business=business_name)
         grid = st.dataframe(
-            register_frame[["Cleared", "Written", "Check #", "Direction", "Amount", "Counterparty", "Memo", "Bank",
-                            "Account", "Category", "Treatment", "Transaction #", "Source file"]],
+            register_frame[["Cleared", "Written", "Check #", "Direction", "From", "To", "Amount", "Counterparty", "Memo",
+                            "Bank", "Account", "Category", "Treatment", "Split", "Transaction #", "Source file"]],
             hide_index=True, width="stretch", key=grid_key,
             on_select="rerun", selection_mode="single-row",
             column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
@@ -1799,7 +2056,7 @@ elif page == "Review Queue":
         st.success("Nothing needs review.")
         st.stop()
     item_by_label = {f"{row['transaction_date']} · {money(row['signed_amount'])} · {row['description'][:75]}": row for row in queue}
-    label = st.selectbox("Transaction", list(item_by_label))
+    label = st.selectbox("Transaction", list(item_by_label), key="review_txn_pick")
     row = item_by_label[label]
     category_by_name = {item["name"]: item for item in categories}
     category_defaults = {item["name"]: item["default_treatment"] for item in categories}
@@ -1813,7 +2070,32 @@ elif page == "Review Queue":
             f'<div class="account">{escape(str(row["account"]))}</div></div>', unsafe_allow_html=True)
         st.caption(f"Bank category: {row.get('source_category') or 'Not supplied'}")
         st.caption("Use short matching text such as MULTIVISIONOPERA. Vendor mappings apply across this business.")
+        def review_jump(best: dict) -> None:
+            target = next((lbl for lbl, item in item_by_label.items() if int(item["id"]) == int(best["id"])), None)
+            if target:
+                st.button("Go to that transaction", key=f"review_jump_{best['id']}",
+                          on_click=lambda: st.session_state.__setitem__("review_txn_pick", target))
+            else:
+                st.caption("That transaction is not in this review queue.")
+        pdf_info, pdf_ident = render_document_preview("review", business_id, int(row["id"]), review_jump)
     with right:
+        if pdf_info:
+            with st.container(border=True):
+                st.markdown("**Read from the PDF you are viewing**")
+                st.caption(" · ".join(bit for bit in [
+                    f"Vendor: {pdf_info['vendor']}" if pdf_info["vendor"] else "",
+                    f"Invoice {pdf_info['invoice']}" if pdf_info["invoice"] else "",
+                    f"Total {money(pdf_info['total'])}" if pdf_info["total"] else "",
+                    f"Date {pdf_info['dates'][0]}" if pdf_info["dates"] else ""] if bit) or "No details found.")
+                if pdf_info["total"] and abs(pdf_info["total"] - abs(float(row["signed_amount"]))) >= 0.005:
+                    st.warning(f"The PDF total ({money(pdf_info['total'])}) differs from this transaction "
+                               f"({money(abs(float(row['signed_amount'])))}). Check it is the right document.")
+                note_text = " · ".join(bit for bit in [
+                    f"Invoice {pdf_info['invoice']}" if pdf_info["invoice"] else "",
+                    f"dated {pdf_info['dates'][0]}" if pdf_info["dates"] else ""] if bit)
+                st.button("Use these details", key=f"review_use_pdf_{row['id']}", on_click=apply_pdf_details,
+                          args=(f"review_vendor_{row['id']}", f"review_notes_{row['id']}", pdf_info["vendor"], note_text),
+                          help="Fills the From / To name and the note below. You can still change them before saving.")
         category_key = f"review_category_{row['id']}"
         treatment_key = f"review_treatment_{row['id']}"
         if treatment_key not in st.session_state:
@@ -1852,8 +2134,17 @@ elif page == "Review Queue":
             "Expense refund": "Refund received from",
             "Transfer": "Transferred to / from",
         }.get(treatment, "Counterparty name")
-        vendor_name = st.text_input(counterparty_label, value=suggested_pattern,
-                                    key=f"review_vendor_{row['id']}")
+        money_in_row = float(row["signed_amount"]) >= 0
+        our_side = f"{business_name} · {row['account']}"
+        ft1, ft2 = st.columns(2)
+        if money_in_row:
+            vendor_name = ft1.text_input("From (who sent it)", value=suggested_pattern, key=f"review_vendor_{row['id']}",
+                                         help=f"{counterparty_label}. Saved as the party on this transaction.")
+            ft2.text_input("To (us)", value=our_side, disabled=True, key=f"review_to_{row['id']}")
+        else:
+            ft1.text_input("From (us)", value=our_side, disabled=True, key=f"review_from_{row['id']}")
+            vendor_name = ft2.text_input("To (who received it)", value=suggested_pattern, key=f"review_vendor_{row['id']}",
+                                         help=f"{counterparty_label}. Saved as the party on this transaction.")
         save_vendor = st.checkbox("Save this counterparty mapping", value=True,
                                   key=f"review_save_vendor_{row['id']}",
                                   help="Future matching transactions will receive this category and treatment automatically.")
@@ -1862,7 +2153,10 @@ elif page == "Review Queue":
         notes = st.text_input("Optional note", key=f"review_notes_{row['id']}")
         if st.button("Save decision & learn", type="primary", width="stretch", key=f"review_save_{row['id']}"):
             category_id = int(category_by_name[category_name]["id"]) if category_name in category_by_name else None
-            if save_vendor and category_id is None:
+            direction_problem = db.loan_direction_error(float(row["signed_amount"]), treatment)
+            if direction_problem:
+                st.error(direction_problem)
+            elif save_vendor and category_id is None:
                 st.error("Select a category before saving a vendor mapping.")
             elif len(db.normalize_description(pattern)) < 3:
                 st.error("Use at least three characters for the partial match.")
@@ -1885,6 +2179,7 @@ elif page == "Review Queue":
                         db.set_transaction_counterparty(
                             connection, business_id=business_id, transaction_id=int(row["id"]),
                             counterparty=vendor_name)
+                finish_document("review", pdf_ident)
                 st.success(f"Saved. {max(applied - (1 if save_vendor else 0), 0)} other matching waiting transaction(s) were classified.")
                 rerun()
 
@@ -1906,7 +2201,13 @@ elif page == "Transactions":
     frame["category"] = frame["category"].fillna("Uncategorized")
     frame["counterparty"] = frame["counterparty"].fillna("")
     frame["loan_role"] = frame["treatment"].map(db.LOAN_ROLES).fillna("")
-    f1, f2, f3, f4 = st.columns(4)
+    frame = add_from_to(frame, amount_col="signed_amount", direction_col=None, account_col="account",
+                        party_col="counterparty", business=business_name)
+    frame["Debit / Credit"] = frame["signed_amount"].map(lambda v: "Credit" if float(v) >= 0 else "Debit")
+    frame["Split"] = [("🔒 Split original" if status == "split" else f"↳ Line of #{int(parent)}" if pd.notna(parent)
+                       else "Needs split" if int(linked or 0) >= 2 else "")
+                      for status, parent, linked in zip(frame["status"], frame["split_parent_id"], frame["linked_checks"])]
+    f1, f2, f3, f4, f5 = st.columns(5)
     with f1:
         account_filters = st.multiselect("Accounts", sorted(frame["account"].dropna().unique()),
                                          placeholder="All accounts")
@@ -1917,11 +2218,21 @@ elif page == "Transactions":
         treatment_filters = st.multiselect("Treatments", sorted(frame["treatment"].dropna().unique()),
                                            placeholder="All treatments")
     with f4:
-        status_filters = st.multiselect("Statuses", sorted(frame["status"].dropna().unique()),
+        status_options = sorted(frame["status"].dropna().unique())
+        status_filters = st.multiselect("Statuses", status_options, key="txn_status_filter",
+                                        default=["needs_review"] if "needs_review" in status_options else [],
                                         placeholder="All statuses")
+    with f5:
+        side_filters = st.multiselect("Debit / Credit", ["Debit", "Credit"], placeholder="Both")
     valid_dates = frame["transaction_date"].dropna()
     date_value = (valid_dates.min().date(), valid_dates.max().date()) if not valid_dates.empty else (date.today(), date.today())
-    selected_dates = st.date_input("Transaction date range", value=date_value)
+    dr1, dr2 = st.columns([2, 1])
+    selected_dates = dr1.date_input("Transaction date range", value=date_value)
+    split_filters = dr2.multiselect("Split status", ["Needs split", "🔒 Split original", "↳ Split line"],
+                                    placeholder="All transactions",
+                                    help="Needs split: a bank transaction with 2 or more checks in the check register that "
+                                         "hasn't been split yet. Split original: locked until its split is reverted. "
+                                         "Split line: one of the lines a split created.")
     filtered = frame.copy()
     if search.strip():
         searchable = filtered.fillna("").astype(str).agg(" | ".join, axis=1)
@@ -1934,6 +2245,17 @@ elif page == "Transactions":
         filtered = filtered[filtered["treatment"].isin(treatment_filters)]
     if status_filters:
         filtered = filtered[filtered["status"].isin(status_filters)]
+    if side_filters:
+        filtered = filtered[filtered["Debit / Credit"].isin(side_filters)]
+    if split_filters:
+        keep = pd.Series(False, index=filtered.index)
+        if "Needs split" in split_filters:
+            keep |= filtered["Split"] == "Needs split"
+        if "🔒 Split original" in split_filters:
+            keep |= filtered["Split"] == "🔒 Split original"
+        if "↳ Split line" in split_filters:
+            keep |= filtered["Split"].str.startswith("↳")
+        filtered = filtered[keep]
     if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
         start_date, end_date = selected_dates
         filtered = filtered[(filtered["transaction_date"].dt.date >= start_date) &
@@ -1941,9 +2263,9 @@ elif page == "Transactions":
     sort1, sort2 = st.columns([2, 1])
     sortable_columns = {
         "Date": "transaction_date", "Account": "account", "Description": "description",
-        "Amount": "signed_amount", "Category": "category", "Treatment": "treatment",
+        "Amount": "signed_amount", "Debit / Credit": "Debit / Credit", "Category": "category", "Treatment": "treatment",
         "Status": "status", "Reference": "source_reference", "Notes": "notes",
-        "Counterparty / loan party": "counterparty", "Loan role": "loan_role",
+        "Counterparty / loan party": "counterparty", "Loan role": "loan_role", "From": "From", "To": "To",
     }
     with sort1:
         sort_label = st.selectbox("Sort by", list(sortable_columns))
@@ -1959,15 +2281,302 @@ elif page == "Transactions":
         st.download_button("Download filtered CSV", filtered.to_csv(index=False).encode("utf-8"),
                            file_name=f"{db.slugify(business_name)}-filtered-transactions.csv",
                            mime="text/csv", width="stretch")
+    category_by_name = {item["name"]: item for item in categories}
+    def render_split_log() -> None:
+        with db.connect(DB_PATH) as connection:
+            log = db.list_split_log(connection, business_id)
+        with st.expander(f"Split log ({len(log)})"):
+            if not log:
+                st.caption("No transactions have been split yet. Open a transaction and press ✂ Split….")
+                return
+            st.dataframe(pd.DataFrame([{
+                "When": row["created_at"][:19].replace("T", " "), "Action": row["action"], "#": row["parent_id"],
+                "Transaction": row["parent_summary"], "Amount": row["parent_amount"], "Lines": row["lines"],
+                "Detail": row["detail"], "Now": "split" if row["current_status"] == "split" else "not split"}
+                for row in log]), hide_index=True, width="stretch",
+                column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            active = {}
+            for row in log:
+                if row["current_status"] == "split":
+                    active.setdefault(row["parent_id"], row["parent_summary"])
+            if active:
+                pick = st.selectbox("Revert a split", list(active), format_func=lambda pid: f"#{pid} · {active[pid]}",
+                                    key="split_log_revert_pick")
+                if st.button("Revert this split", key="split_log_revert"):
+                    with db.connect(DB_PATH) as connection:
+                        removed = db.revert_split(connection, business_id=business_id, transaction_id=int(pick))
+                    st.session_state["txn_saved_message"] = f"Reverted split #{pick}: {removed} line(s) removed."
+                    rerun()
+
+    st.session_state.setdefault("txn_edit_window", True)
+    window_mode = st.toggle("Edit in a window: click a row to open it", key="txn_edit_window",
+                            help="Streamlit tables cannot detect a double-click, so a single click on any cell opens the edit window. "
+                                 "Turn this off for the spreadsheet grid and bulk actions.")
+    if window_mode:
+        pick_columns = ["id", "transaction_date", "description", "signed_amount", "Debit / Credit", "category",
+                        "treatment", "From", "To", "counterparty", "status", "Split", "notes", "account"]
+        st.caption("Click any cell in a row to edit it in a window, with Previous / Next to move through the list. "
+                   "Turn the switch off for the spreadsheet grid and bulk actions.")
+        nav_ids = [int(value) for value in filtered["id"].tolist()]
+        st.session_state["txn_nav_ids"] = nav_ids
+        if st.session_state.pop("txn_clear_pick", False):
+            st.session_state["txn_pick_grid"] = {"selection": {"rows": [], "columns": [], "cells": []}}
+            st.session_state["txn_pick_seen"] = None
+        pick_grid = st.dataframe(
+            filtered[pick_columns].rename(columns={"id": "#"}), hide_index=True, width="stretch", height=650,
+            on_select="rerun", selection_mode=["single-cell", "single-row"], key="txn_pick_grid",
+            column_config={"signed_amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+                           "description": st.column_config.TextColumn(width="large")})
+
+        def close_txn_dialog() -> None:
+            st.session_state.pop("txn_dialog_id", None)
+            st.session_state["txn_clear_pick"] = True
+
+        def render_split_panel(txn: dict, transaction_id: int, amount: float) -> None:
+            is_split = txn["status"] == "split"
+            total_abs = round(abs(amount), 2)
+            money_in = amount >= 0
+            st.markdown("#### Split this transaction" if not is_split else "#### This transaction is split")
+            with st.expander("📎 View a document"):
+                render_document_preview(f"split_{transaction_id}", business_id)
+            st.caption("The lines you enter here become the source for revenue and expense; the original bank "
+                       "transaction is kept but left out of the reports. Nothing is lost: Revert restores it, and every "
+                       "change is written to the Split log.")
+            if is_split:
+                with db.connect(DB_PATH) as connection:
+                    locked_lines = db.get_split_lines(connection, transaction_id)
+                st.warning(f"🔒 **Original bank transaction, locked.** It is split into {len(locked_lines)} lines, and "
+                           "those lines are what the reports use. It cannot be edited. To change it, revert the split "
+                           "(this deletes the lines), then split it again.")
+                st.dataframe(pd.DataFrame([{
+                    "Line #": line["id"], "Amount": abs(float(line["signed_amount"])),
+                    "Category": line["category"] or "Uncategorized", "Treatment": line["treatment"],
+                    "From / To": line["counterparty"] or "", "Notes": line["notes"] or ""} for line in locked_lines]),
+                    hide_index=True, width="stretch",
+                    column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+                sure = st.checkbox("I understand the split lines will be deleted", key=f"txd_revert_sure_{transaction_id}")
+                r1, r2 = st.columns(2)
+                if r1.button("Revert split", type="primary", width="stretch", disabled=not sure,
+                             help="Deletes the lines and restores the transaction as it was before the split."):
+                    with db.connect(DB_PATH) as connection:
+                        removed = db.revert_split(connection, business_id=business_id, transaction_id=transaction_id)
+                    st.session_state.pop("txn_split_mode", None)
+                    st.toast(f"Reverted: {removed} line(s) removed")
+                    rerun_dialog()
+                if r2.button("Close", width="stretch", key=f"txd_locked_close_{transaction_id}"):
+                    close_txn_dialog()
+                    st.rerun()
+                return
+            names = list(category_by_name)
+            with db.connect(DB_PATH) as connection:
+                existing = db.get_split_lines(connection, transaction_id) if is_split else []
+            default_treatment = "Revenue" if money_in else "Expense"
+            if existing:
+                starter = pd.DataFrame([{
+                    "Amount": abs(float(l["signed_amount"])), "Category": l["category"] or "Uncategorized",
+                    "Treatment": l["treatment"], "From / To": l["counterparty"] or "", "Notes": l["notes"] or ""}
+                    for l in existing])
+            else:
+                with db.connect(DB_PATH) as connection:
+                    check_lines = db.deposit_check_lines(connection, transaction_id)
+                if len(check_lines) >= 2:
+                    st.info(f"Pre-filled from the {len(check_lines)} checks recorded for this deposit. "
+                            "Choose each line's category and treatment.")
+                    starter = pd.DataFrame([{
+                        "Amount": float(line["amount"]),
+                        "Category": line["category"] if line["category"] in category_by_name else "Uncategorized",
+                        "Treatment": line["treatment"] if line["treatment"] in db.TREATMENTS[:-1] else default_treatment,
+                        "From / To": line["payee"] or "",
+                        "Notes": (f"Check #{line['check_number']}" if line["check_number"] and not str(line["check_number"]).startswith(("DEP-", "CASH-"))
+                                  else "Cash" if str(line["check_number"]).startswith("CASH-") else "") +
+                                 (f" {line['memo']}" if line["memo"] and line["memo"] != "Cash deposit" else "")}
+                        for line in check_lines])
+                else:
+                    starter = pd.DataFrame([{"Amount": None, "Category": "Uncategorized", "Treatment": default_treatment,
+                                             "From / To": "", "Notes": ""} for _ in range(2)])
+            edited_lines = st.data_editor(
+                starter, key=f"txd_split_{transaction_id}_{len(existing)}_{len(starter)}", num_rows="dynamic", hide_index=True,
+                width="stretch",
+                column_config={
+                    "Amount": st.column_config.NumberColumn(format="$%.2f", min_value=0.0, step=0.01),
+                    "Category": st.column_config.SelectboxColumn(options=["Uncategorized"] + names),
+                    "Treatment": st.column_config.SelectboxColumn(options=list(db.TREATMENTS[:-1])),
+                    "From / To": st.column_config.TextColumn(
+                        "From (who sent it)" if money_in else "To (who received it)"),
+                })
+            filled = edited_lines.dropna(subset=["Amount"])
+            line_total = round(float(filled["Amount"].sum()), 2) if len(filled) else 0.0
+            remaining = round(total_abs - line_total, 2)
+            if abs(remaining) < 0.005:
+                st.success(f"The lines add up to {money(total_abs)}.")
+            else:
+                st.warning(f"The lines add up to {money(line_total)}; "
+                           f"{money(abs(remaining))} {'still to place' if remaining > 0 else 'too much'}.")
+            lines = []
+            problems = []
+            for number, (_, row) in enumerate(filled.iterrows(), start=1):
+                category_name = str(row["Category"] or "Uncategorized")
+                category = category_by_name.get(category_name)
+                line_treatment = row["Treatment"] if isinstance(row["Treatment"], str) and row["Treatment"] else (
+                    category["default_treatment"] if category else default_treatment)
+                error = db.loan_direction_error(amount / abs(amount) * float(row["Amount"]), line_treatment) if amount else None
+                if error:
+                    problems.append(f"Line {number}: {error}")
+                lines.append({"amount": float(row["Amount"]), "category_id": int(category["id"]) if category else None,
+                              "treatment": line_treatment, "counterparty": str(row["From / To"] or ""),
+                              "notes": str(row["Notes"] or "")})
+            for problem in problems:
+                st.error(problem)
+            s1, s2, s3 = st.columns(3)
+            if s1.button("Save split" if not is_split else "Save changes", type="primary", width="stretch",
+                         disabled=abs(remaining) >= 0.005 or len(lines) < 2 or bool(problems)):
+                try:
+                    with db.connect(DB_PATH) as connection:
+                        db.split_transaction(connection, business_id=business_id, transaction_id=transaction_id, lines=lines)
+                    st.session_state.pop("txn_split_mode", None)
+                    st.toast(f"Split #{transaction_id} into {len(lines)} lines")
+                    rerun_dialog()
+                except ValueError as exc:
+                    st.error(str(exc))
+            if is_split:
+                if s2.button("Revert split", width="stretch",
+                             help="Deletes the lines and restores the transaction as it was before the split."):
+                    with db.connect(DB_PATH) as connection:
+                        removed = db.revert_split(connection, business_id=business_id, transaction_id=transaction_id)
+                    st.session_state.pop("txn_split_mode", None)
+                    st.toast(f"Reverted: {removed} line(s) removed")
+                    rerun_dialog()
+            elif s2.button("Back", width="stretch"):
+                st.session_state.pop("txn_split_mode", None)
+                rerun_dialog()
+            if s3.button("Close", width="stretch", key=f"txd_split_close_{transaction_id}"):
+                close_txn_dialog()
+                st.rerun()
+
+        @st.dialog("Edit transaction", width="large", on_dismiss=close_txn_dialog)
+        def edit_transaction_dialog() -> None:
+            ids = st.session_state.get("txn_nav_ids", [])
+            transaction_id = int(st.session_state.get("txn_dialog_id", 0))
+            with db.connect(DB_PATH) as connection:
+                txn = db.get_transaction(connection, transaction_id)
+            if not txn or int(txn["business_id"]) != business_id:
+                st.error("That transaction could not be found.")
+                return
+            position = ids.index(transaction_id) if transaction_id in ids else 0
+            prev_col, label_col, next_col = st.columns([1, 2, 1])
+            if prev_col.button("◀ Previous", width="stretch", disabled=position <= 0):
+                st.session_state["txn_dialog_id"] = ids[position - 1]
+                st.session_state.pop("txn_split_mode", None)
+                rerun_dialog()
+            label_col.markdown(f"<div style='text-align:center;padding-top:0.4rem'>#{transaction_id} · "
+                               f"{position + 1} of {len(ids)}</div>", unsafe_allow_html=True)
+            if next_col.button("Next ▶", width="stretch", disabled=position >= len(ids) - 1):
+                st.session_state["txn_dialog_id"] = ids[position + 1]
+                st.session_state.pop("txn_split_mode", None)
+                rerun_dialog()
+            amount = float(txn["signed_amount"])
+            ours = f"{business_name} · {txn['account_name']}"
+            suffix = f"_{transaction_id}"
+            st.markdown(f"**{txn['transaction_date']}** · {money(amount)} · {txn['description']}")
+            is_child = bool(txn.get("split_parent_id"))
+            if txn["status"] == "split" or st.session_state.get("txn_split_mode") == transaction_id:
+                render_split_panel(txn, transaction_id, amount)
+                return
+            if is_child:
+                st.info(f"This is one line of the split of transaction #{txn['split_parent_id']}. "
+                        "Its amount is fixed. To change the split itself, open the locked original and revert it first.")
+            fr, to = st.columns(2)
+            if amount >= 0:
+                party = fr.text_input("From (who sent it)", value=txn["counterparty"] or "", key="txd_party" + suffix)
+                to.text_input("To (us)", value=ours, disabled=True, key="txd_us" + suffix)
+            else:
+                fr.text_input("From (us)", value=ours, disabled=True, key="txd_us" + suffix)
+                party = to.text_input("To (who received it)", value=txn["counterparty"] or "", key="txd_party" + suffix)
+            d1, d2 = st.columns(2)
+            cat_options = ["Uncategorized"] + list(category_by_name)
+            current_cat = txn["category_name"] if txn["category_name"] in category_by_name else "Uncategorized"
+            category_choice = d1.selectbox("Category", cat_options, index=cat_options.index(current_cat),
+                                           key="txd_cat" + suffix)
+            treatment_options = list(db.TREATMENTS[:-1])
+            current_treatment = txn["treatment"] if txn["treatment"] in treatment_options else treatment_options[0]
+            if (txn["treatment"] not in treatment_options and category_choice in category_by_name):
+                current_treatment = category_by_name[category_choice]["default_treatment"]
+            treatment_choice = d2.selectbox("Treatment", treatment_options, index=treatment_options.index(current_treatment),
+                                            key="txd_treat" + suffix)
+            related_names = ["— None —"] + [a["name"] for a in accounts if int(a["id"]) != int(txn["account_id"])]
+            related_now = txn["related_account_name"] if txn["related_account_name"] in related_names else "— None —"
+            related_choice = st.selectbox("Related account (transfers and loans)", related_names,
+                                          index=related_names.index(related_now), key="txd_rel" + suffix)
+            note = st.text_area("Notes (for loans: why it was given or taken)", value=txn["notes"] or "", height=90,
+                                key="txd_note" + suffix)
+            with st.expander("📎 View a document"):
+                render_document_preview(f"edit_{transaction_id}", business_id)
+            remember = st.checkbox("Remember this category and treatment for similar transactions", value=False,
+                                   key="txd_remember" + suffix)
+            problem = db.loan_direction_error(amount, treatment_choice)
+            if problem:
+                st.error(problem)
+
+            def save_current() -> None:
+                related_id = next((int(a["id"]) for a in accounts if a["name"] == related_choice), None)
+                category_id = None if category_choice == "Uncategorized" else int(category_by_name[category_choice]["id"])
+                with db.connect(DB_PATH) as connection:
+                    if remember and category_id is not None:
+                        db.classify_transaction(connection, transaction_id, category_id=category_id,
+                                                treatment=treatment_choice, related_account_id=related_id,
+                                                notes=note.strip() or None, apply_existing=False)
+                    else:
+                        db.update_transaction_classification(connection, transaction_id, category_id=category_id,
+                                                             treatment=treatment_choice, related_account_id=related_id,
+                                                             notes=note.strip() or None)
+                    db.set_transaction_counterparty(connection, business_id=business_id, transaction_id=transaction_id,
+                                                    counterparty=party)
+
+            b1, b2, b4, b3 = st.columns(4)
+            if b1.button("Save", width="stretch", disabled=bool(problem)):
+                save_current()
+                st.toast(f"Saved #{transaction_id}")
+                rerun_dialog()
+            if b2.button("Save & next ▶", type="primary", width="stretch",
+                         disabled=bool(problem) or position >= len(ids) - 1):
+                save_current()
+                st.toast(f"Saved #{transaction_id}")
+                st.session_state["txn_dialog_id"] = ids[position + 1]
+                rerun_dialog()
+            if b4.button("✂ Split…", width="stretch", disabled=is_child,
+                         help="Split this transaction into several lines, each with its own category."):
+                st.session_state["txn_split_mode"] = transaction_id
+                rerun_dialog()
+            if b3.button("Close", width="stretch"):
+                close_txn_dialog()
+                st.rerun()
+
+        picked_position = (pick_grid.selection.cells[0][0] if pick_grid.selection.cells
+                           else pick_grid.selection.rows[0] if pick_grid.selection.rows else None)
+        if picked_position is not None:
+            picked = int(filtered.iloc[picked_position]["id"])
+            seen = picked
+            if st.session_state.get("txn_pick_seen") != seen:
+                st.session_state["txn_pick_seen"] = seen
+                st.session_state["txn_dialog_id"] = picked
+                edit_transaction_dialog()
+            elif st.session_state.get("txn_dialog_id"):
+                edit_transaction_dialog()
+        elif st.session_state.get("txn_dialog_id"):
+            edit_transaction_dialog()
+        if st.session_state.get("txn_saved_message"):
+            st.success(st.session_state.pop("txn_saved_message"))
+        render_split_log()
+        st.stop()
     section_label("Editable transaction grid")
-    st.caption("Check rows for bulk changes. Edit Category, Treatment or Counterparty directly; copy/paste and drag-fill work like a spreadsheet. "
+    st.caption("Check rows for bulk changes. Edit Category, Treatment, Counterparty or the From / To of the other party directly; copy/paste and drag-fill work like a spreadsheet. "
                "For loans, Counterparty is who you borrowed from or lent to — the Loan role column shows which.")
     category_names = [item["name"] for item in categories]
     category_by_name = {item["name"]: item for item in categories}
     select_all_visible = st.checkbox("Check all filtered transactions", value=False,
                                      help="Selects every transaction matching the current search and filters.")
-    editor_columns = ["id", "transaction_date", "account", "description", "signed_amount", "category",
-                      "treatment", "loan_role", "counterparty", "status", "source_reference", "notes"]
+    editor_columns = ["id", "transaction_date", "account", "description", "From", "To", "signed_amount", "Debit / Credit", "category",
+                      "treatment", "loan_role", "counterparty", "status", "Split", "source_reference", "notes"]
     editor_source = filtered[editor_columns].copy()
     editor_source.insert(0, "Select", select_all_visible)
     editor_source = editor_source.set_index("id", drop=False)
@@ -1979,10 +2588,11 @@ elif page == "Transactions":
         width="stretch",
         height=650,
         key=editor_key,
-        disabled=["id", "transaction_date", "account", "description", "signed_amount",
+        disabled=["id", "transaction_date", "account", "description", "signed_amount", "Debit / Credit", "Split",
                   "loan_role", "status", "source_reference", "notes"],
-        column_order=["Select", "transaction_date", "account", "description", "signed_amount",
-                      "category", "treatment", "loan_role", "counterparty", "status", "source_reference", "notes"],
+        column_order=["Select", "transaction_date", "description", "signed_amount", "Debit / Credit",
+                      "category", "treatment", "From", "To", "loan_role", "counterparty", "status", "Split",
+                      "source_reference", "notes", "account"],
         column_config={
             "Select": st.column_config.CheckboxColumn("Select", help="Select rows for a bulk category change"),
             "transaction_date": st.column_config.TextColumn("Date"),
@@ -1992,6 +2602,8 @@ elif page == "Transactions":
             "treatment": st.column_config.SelectboxColumn("Treatment", options=list(db.TREATMENTS[:-1]),
                                                             required=True),
             "loan_role": st.column_config.TextColumn("Loan role", help="Borrowed from, Repaid to, Lent to or Repaid by"),
+            "From": st.column_config.TextColumn("From", help="Money in: edit this to set who sent it. Money out: your own account (not editable)."),
+            "To": st.column_config.TextColumn("To", help="Money out: edit this to set who received it. Money in: your own account (not editable)."),
             "counterparty": st.column_config.TextColumn(
                 "Counterparty / loan party", help="Who you paid or received from. For loans: the lender or borrower."),
         },
@@ -2003,8 +2615,18 @@ elif page == "Transactions":
         if (edited_row["category"] != original_row["category"] or
                 edited_row["treatment"] != original_row["treatment"]):
             changed_ids.append(int(transaction_id))
-        if str(edited_row["counterparty"] or "").strip() != str(original_row["counterparty"] or "").strip():
+        party_column = "From" if float(original_row["signed_amount"]) >= 0 else "To"
+        new_party = str(edited_row["counterparty"] or "").strip()
+        if new_party == str(original_row["counterparty"] or "").strip():
+            side_value = str(edited_row[party_column] or "").strip()
+            if side_value != str(original_row[party_column] or "").strip():
+                new_party = "" if side_value == "(not set)" else side_value
+                edited.loc[transaction_id, "counterparty"] = new_party
+        if new_party != str(original_row["counterparty"] or "").strip():
             counterparty_changed_ids.append(int(transaction_id))
+    split_parents = {int(t) for t in editor_source.index if editor_source.loc[t, "Split"] == "🔒 Split original"}
+    changed_ids = [t for t in changed_ids if t not in split_parents]
+    counterparty_changed_ids = [t for t in counterparty_changed_ids if t not in split_parents]
     unsaved_total = len(set(changed_ids) | set(counterparty_changed_ids))
     selected_ids = [int(transaction_id) for transaction_id, row in edited.iterrows() if bool(row["Select"])]
     save1, save2 = st.columns([1, 2])
@@ -2012,6 +2634,13 @@ elif page == "Transactions":
         if st.button(f"Save {unsaved_total:,} edited row(s)", type="primary", width="stretch",
                      disabled=not unsaved_total):
             saved = 0
+            bad_direction = [
+                f"#{tid}: {msg}" for tid in changed_ids
+                if (msg := db.loan_direction_error(float(editor_source.loc[tid]["signed_amount"]),
+                                                   str(edited.loc[tid]["treatment"])))]
+            if bad_direction:
+                st.error("Nothing was saved. " + " ".join(bad_direction))
+                st.stop()
             with db.connect(DB_PATH) as connection:
                 for transaction_id in counterparty_changed_ids:
                     db.set_transaction_counterparty(
@@ -2042,6 +2671,7 @@ elif page == "Transactions":
     with bulk3:
         st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
         if st.button("Apply to selected", width="stretch", disabled=not selected_ids or bulk_category == "— Choose category —"):
+            skipped_direction = 0
             with db.connect(DB_PATH) as connection:
                 for transaction_id in selected_ids:
                     if bulk_category == "— Clear category —":
@@ -2050,12 +2680,23 @@ elif page == "Transactions":
                         chosen_category = category_by_name[bulk_category]
                         chosen_treatment = (chosen_category["default_treatment"] if bulk_treatment == "Use category default"
                                             else bulk_treatment)
+                        if transaction_id in split_parents:
+                            skipped_direction += 1
+                            continue
+                        if db.loan_direction_error(float(editor_source.loc[transaction_id]["signed_amount"]), chosen_treatment):
+                            skipped_direction += 1
+                            continue
                         db.classify_transaction(connection, transaction_id,
                                                 category_id=int(chosen_category["id"]),
                                                 treatment=chosen_treatment, apply_existing=False)
             action = "cleared categories from" if bulk_category == "— Clear category —" else f"set {bulk_category} on"
-            st.success(f"Successfully {action} {len(selected_ids)} transaction(s).")
+            st.success(f"Successfully {action} {len(selected_ids) - skipped_direction} transaction(s).")
+            if skipped_direction:
+                st.warning(f"{skipped_direction} row(s) skipped: that loan treatment points the wrong way for the money.")
             rerun()
+    if st.session_state.get("txn_saved_message"):
+        st.success(st.session_state.pop("txn_saved_message"))
+    render_split_log()
     with st.expander("＋ Add a transaction category"):
         with st.form("transaction_add_category", clear_on_submit=True):
             new_category_name = st.text_input("Category name")
@@ -2079,6 +2720,39 @@ elif page == "Reports":
         vendor_rows = db.vendor_report(connection, business_id, r_start, r_end)
 
     with tab_loans:
+        with db.connect(DB_PATH) as connection:
+            direction_problems = db.loan_direction_problems(connection, business_id)
+        if direction_problems:
+            st.warning(f"{len(direction_problems)} loan entr{'y needs' if len(direction_problems) == 1 else 'ies need'} fixing. "
+                       "Money received marked as repaid by us, or the owner's own money filed as a loan, will never net "
+                       "against the real loans. For the owner's money use Owner contribution (money in) and "
+                       "Owner draw (money out): neither is income, expense or a loan.")
+            fix_frame = pd.DataFrame([{
+                "Fix": True, "Date": p["date"], "Account": p["account"], "Description": p["description"],
+                "Amount": p["signed_amount"], "Marked as": p["treatment"], "Problem": p["problem"],
+                "Change to": p["suggested"], "Party": p["counterparty"] or ""} for p in direction_problems])
+            fix_frame.index = [p["id"] for p in direction_problems]
+            fixed = st.data_editor(
+                fix_frame, key="loan_direction_editor", width="stretch",
+                disabled=["Date", "Account", "Description", "Amount", "Marked as", "Problem"],
+                column_config={
+                    "Amount": st.column_config.NumberColumn(format="$%.2f"),
+                    "Description": st.column_config.TextColumn(width="large"),
+                    "Problem": st.column_config.TextColumn(width="medium"),
+                    "Change to": st.column_config.SelectboxColumn(
+                        "Change to", options=list(db.LOAN_TREATMENTS) + ["Owner contribution", "Owner draw"], required=True,
+                        help="Must match the direction: money in or money out."),
+                    "Party": st.column_config.TextColumn("Party (lender / borrower / owner)")})
+            if st.button("Apply the ticked fixes", type="primary", key="apply_loan_fixes"):
+                try:
+                    with db.connect(DB_PATH) as connection:
+                        count = db.fix_loan_rows(connection, business_id, [
+                            {"id": int(tid), "treatment": row["Change to"], "counterparty": row["Party"]}
+                            for tid, row in fixed.iterrows() if row["Fix"]])
+                    st.success(f"Fixed {count} loan entr{'y' if count == 1 else 'ies'}.")
+                    rerun()
+                except Exception as exc:
+                    st.error(str(exc))
         render_loan_balances(loan_rows)
         if not loan_rows:
             st.info("No loan activity in this period.")
@@ -2113,13 +2787,48 @@ elif page == "Reports":
             section_label("Loan transactions")
             ledger_frame = pd.DataFrame(loan_ledger_rows).rename(columns={
                 "date": "Date", "party": "Party", "role": "Role", "treatment": "Treatment", "amount": "Amount",
-                "account": "Account", "description": "Description", "source": "Source"})
+                "account": "Account", "description": "Description", "source": "Source", "notes": "Notes"})
+            ledger_frame.index = [f"{k}:{i}" for k, i in zip(ledger_frame["kind"], ledger_frame["id"])]
+            us_label = ledger_frame["Account"].map(lambda account: f"{business_name} ({account})")
+            money_in = ledger_frame["Treatment"].isin(["Loan draw", "Receivable repayment"])
+            ledger_frame["From"] = ledger_frame["Party"].where(money_in, us_label)
+            ledger_frame["To"] = us_label.where(money_in, ledger_frame["Party"])
+            ledger_frame["What happened"] = ledger_frame["Treatment"].map({
+                "Loan draw": "Loan received", "Principal repayment": "Loan repaid by us",
+                "Loan receivable": "Loan made by us", "Receivable repayment": "Loan repaid to us"})
             party_pick = st.selectbox("Party", ["All parties"] + sorted(ledger_frame["Party"].unique()), key="loan_party_filter")
             if party_pick != "All parties":
-                ledger_frame = ledger_frame[ledger_frame["Party"] == party_pick]
-            st.dataframe(ledger_frame, hide_index=True, width="stretch",
-                         column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
-            csv_download("Download loan transactions (CSV)", ledger_frame, "loan-transactions", "dl_loan_ledger")
+                ledger_frame = ledger_frame[ledger_frame["Party"] == party_pick].sort_values("Date", kind="stable")
+                sign = ledger_frame["Treatment"].map({"Loan receivable": 1, "Principal repayment": 1,
+                                                      "Receivable repayment": -1, "Loan draw": -1})
+                ledger_frame["Running balance"] = (sign * ledger_frame["Amount"]).cumsum().round(2)
+                ledger_frame = ledger_frame.iloc[::-1]
+                st.caption("Running balance: positive means they owe us, negative means we owe them. "
+                           "Read it from the bottom (oldest) to see where it goes wrong.")
+            ledger_frame = ledger_frame[["Date", "From", "To", "Amount", "What happened", "Notes", "Account", "Description",
+                                         "Source"] + (["Running balance"] if "Running balance" in ledger_frame else [])]
+            st.caption("Click a Notes cell to write why the loan was given or taken, then press Save notes.")
+            edited_ledger = st.data_editor(
+                ledger_frame, hide_index=True, width="stretch", key=f"loan_ledger_editor_{party_pick}",
+                disabled=[c for c in ledger_frame.columns if c != "Notes"],
+                column_config={"Notes": st.column_config.TextColumn("Notes (why)", width="large",
+                                                                    help="For example: working capital for payroll"),
+                               "Amount": st.column_config.NumberColumn(format="$%.2f"),
+                                        "Running balance": st.column_config.NumberColumn(format="$%.2f"),
+                                        "Date": st.column_config.TextColumn(width="small"),
+                                        "From": st.column_config.TextColumn(width="medium"),
+                                        "To": st.column_config.TextColumn(width="medium"),
+                                        "Description": st.column_config.TextColumn(width="large")})
+            changed_notes = [{"kind": key.split(":")[0], "id": key.split(":")[1], "notes": row["Notes"]}
+                             for key, row in edited_ledger.iterrows()
+                             if (row["Notes"] or "").strip() != (ledger_frame.loc[key, "Notes"] or "").strip()]
+            if st.button(f"Save {len(changed_notes)} note(s)", type="primary", disabled=not changed_notes,
+                         key="save_loan_notes"):
+                with db.connect(DB_PATH) as connection:
+                    db.set_loan_notes(connection, business_id, changed_notes)
+                st.success("Notes saved.")
+                rerun()
+            csv_download("Download loan transactions (CSV)", edited_ledger, "loan-transactions", "dl_loan_ledger")
 
     with tab_excluded:
         include_unreviewed = st.checkbox("Also list transactions not yet classified", key="excluded_unreviewed")
@@ -2266,6 +2975,282 @@ elif page == "Reports":
                 column_config={"Expense in period": st.column_config.NumberColumn(format="$%.2f")})
 
 
+elif page == "Staff & Payroll":
+    month_options = staff_mod.recent_months(30)
+    default_month = date.today().strftime("%Y-%m")
+    month_col, _ = st.columns([1, 3])
+    st.session_state.setdefault("staff_month", default_month if default_month in month_options else month_options[0])
+    month = month_col.selectbox("Month", month_options, key="staff_month")
+    page_header("Staff paid and company revenue",
+                "Enter what you paid each staff member or staff company by month. Pick the deposits that are revenue from a company and see the total.",
+                "Staff & payroll")
+    tab_paid, tab_rev, tab_sum = st.tabs(["Staff paid", "Revenue from a company", "Monthly summary"])
+
+    with tab_paid:
+        with db.connect(DB_PATH) as connection:
+            staff_names = [p["name"] for p in staff_mod.list_staff(connection, business_id)]
+            payments = staff_mod.list_payments(connection, business_id, month)
+            suggestions = staff_mod.payment_suggestions(connection, business_id, month)
+            category_names = [c["name"] for c in db.list_categories(connection, business_id)]
+        previous = staff_mod.previous_month(month)
+        n1, n2, n3, _ = st.columns([2.2, 1, 1, 3])
+        if n1.button(f"Auto-fill {month} from {previous}", key="staff_autofill",
+                     help=f"Looks up each person paid in {previous} and adds their bank payments found in {month}."):
+            with db.connect(DB_PATH) as connection:
+                result = staff_mod.autofill_payments(connection, business_id, month)
+            if not result["people"]:
+                st.info(f"Nobody was entered for {previous}, so there is nothing to fill from.")
+            else:
+                st.success(f"Added {result['added']} payment{'s' if result['added'] != 1 else ''} found in {month}."
+                           + (f" No bank payment found yet for: {', '.join(result['no_match'])}." if result["no_match"] else ""))
+        n2.button("← Previous", key="staff_prev_month", on_click=shift_staff_month, args=(-1,))
+        n3.button("Next month →", key="staff_next_month", on_click=shift_staff_month, args=(1,), type="primary")
+        who_list = st.multiselect("Staff or company (pick several to search them all)", staff_names, accept_new_options=True,
+                                  key="staff_who", placeholder="Pick or type names")
+        if who_list:
+            name_found, seen = [], set()
+            with db.connect(DB_PATH) as connection:
+                for person in who_list:
+                    for t in staff_mod.name_matches(connection, business_id, person, month):
+                        if t["id"] not in seen:
+                            seen.add(t["id"])
+                            name_found.append({**t, "who": person})
+            if name_found:
+                st.caption(f"Bank payments in {month} that mention the names you picked. Untick any that are not theirs, then add them.")
+                found_frame = pd.DataFrame([{
+                    "id": t["id"], "Add": True, "Staff": t["who"], "Date": t["transaction_date"],
+                    "Amount": abs(t["signed_amount"]), "Description": t["description"], "Memo / note": t["memo"],
+                    "Category": t["category"] or ""} for t in name_found])
+                found_edit = st.data_editor(
+                    found_frame, hide_index=True, width="stretch", key=f"staff_found_{'|'.join(who_list)}_{month}",
+                    column_order=["Add", "Staff", "Date", "Amount", "Description", "Memo / note", "Category"],
+                    disabled=["Staff", "Date", "Amount", "Description", "Memo / note", "Category"],
+                    column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+                picked = found_edit[found_edit["Add"]]
+                if st.button(f"Add {len(picked)} payment{'s' if len(picked) != 1 else ''} ({money(float(picked['Amount'].sum()))}) for {month}",
+                             type="primary", key="staff_add_found", disabled=picked.empty):
+                    try:
+                        with db.connect(DB_PATH) as connection:
+                            for person in who_list:
+                                ids = [int(r["id"]) for _, r in picked.iterrows() if r["Staff"] == person]
+                                if ids:
+                                    staff_mod.add_payments_from_transactions(connection, business_id, name=person, month=month,
+                                                                             transaction_ids=ids)
+                        rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+            else:
+                st.caption(f"No unmatched bank payments in {month} mention those names. Enter an amount below for one name.")
+        with st.form("add_staff_payment", clear_on_submit=True):
+            f2, f3, f4 = st.columns([1, 2, 1])
+            amount = f2.number_input("Amount paid", min_value=0.0, step=1.0, format="%.2f")
+            note = f3.text_input("Note (optional)", placeholder="Check number, hours, invoice…")
+            f4.write("")
+            if f4.form_submit_button(f"Add payment for {month}", type="primary"):
+                if len(who_list) != 1:
+                    st.error("Pick exactly one name to add an amount by hand.")
+                else:
+                    try:
+                        with db.connect(DB_PATH) as connection:
+                            staff_mod.add_payment(connection, business_id, name=who_list[0], month=month, amount=amount, note=note)
+                        rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+        total_paid = round(sum(p["amount"] for p in payments), 2)
+        st.metric(f"Total paid in {month}", money(total_paid))
+        if payments:
+            st.dataframe(pd.DataFrame([{
+                "Staff or company": p["staff"], "Amount": p["amount"], "Note": p["note"],
+                "Bank payment": (f"{p['bank_date']} · {p['bank_description'][:50]}" if p["transaction_id"] else "Not matched")}
+                for p in payments]), hide_index=True, width="stretch",
+                column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            per_person: dict[str, float] = {}
+            for p in payments:
+                per_person[p["staff"]] = round(per_person.get(p["staff"], 0.0) + p["amount"], 2)
+            if len(per_person) != len(payments):
+                with st.expander("Totals by person"):
+                    st.dataframe(pd.DataFrame([{"Staff or company": k, "Total": v} for k, v in per_person.items()]),
+                                 hide_index=True, width="stretch",
+                                 column_config={"Total": st.column_config.NumberColumn(format="$%.2f")})
+            r1, r2 = st.columns([3, 1])
+            remove = r1.selectbox("Remove a payment", [p["id"] for p in payments], index=None, placeholder="Choose a payment…",
+                                  format_func=lambda pid: next(f"{p['staff']} · {money(p['amount'])}" for p in payments if p["id"] == pid),
+                                  key="staff_remove")
+            if remove and r2.button("Remove", key="staff_remove_go"):
+                with db.connect(DB_PATH) as connection:
+                    staff_mod.delete_payment(connection, business_id, int(remove))
+                rerun()
+        else:
+            st.info(f"Nothing entered for {month} yet.")
+        if payments:
+            k1, k2 = st.columns([3, 1])
+            copy_target = k1.selectbox("Copy this month's payments to", [m for m in month_options if m != month], index=None,
+                                       placeholder="Choose a month…", key="staff_copy_target",
+                                       help="Copies names, amounts and notes. Bank links are not copied.")
+            if copy_target and k2.button("Copy", key="staff_copy_go"):
+                try:
+                    with db.connect(DB_PATH) as connection:
+                        copied = staff_mod.copy_payments(connection, business_id, month, copy_target)
+                    st.success(f"Copied {copied} payment{'s' if copied != 1 else ''} to {copy_target}."
+                               + ("" if copied else " They were already there."))
+                except ValueError as exc:
+                    st.error(str(exc))
+        if suggestions:
+            section_label("Match to bank payments")
+            default_cat = "Payroll"
+            file_options = ["Don't change the transaction"] + category_names + ([default_cat] if default_cat not in category_names else [])
+            file_choice = st.selectbox("When I link one, file the bank transaction under", file_options, key="staff_file_cat",
+                                       help="Choose a category to also set the transaction's category to it, mark it as an expense and name the payee.")
+            for number, s in enumerate(suggestions[:15]):
+                txn, pay = s["transaction"], s["payment"]
+                c1, c2 = st.columns([5, 1])
+                c1.write(f"**{pay['staff']}** {money(pay['amount'])} ↔ {txn['transaction_date']} · {money(abs(txn['signed_amount']))} · "
+                         f"{txn['description'][:60]} _({s['why']})_")
+                if c2.button("Link", key=f"staff_link_{pay['id']}_{txn['id']}_{number}"):
+                    try:
+                        with db.connect(DB_PATH) as connection:
+                            cat_id = None if file_choice == file_options[0] else db.get_or_create_category(
+                                connection, business_id, file_choice, "Expense")
+                            staff_mod.link_payment(connection, business_id, pay["id"], txn["id"], category_id=cat_id)
+                        rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+        linked = [p for p in payments if p["transaction_id"]]
+        if linked:
+            unlink = st.selectbox("Unlink a bank payment", [p["id"] for p in linked], index=None, placeholder="Choose…",
+                                  format_func=lambda pid: next(f"{p['staff']} · {money(p['amount'])}" for p in linked if p["id"] == pid),
+                                  key="staff_unlink")
+            if unlink and st.button("Unlink", key="staff_unlink_go"):
+                with db.connect(DB_PATH) as connection:
+                    staff_mod.unlink_payment(connection, business_id, int(unlink))
+                rerun()
+
+    with tab_rev:
+        with db.connect(DB_PATH) as connection:
+            company_options = sorted(set(db.known_parties(connection, business_id)) | set(staff_mod.picked_companies(connection, business_id)),
+                                     key=str.lower)
+        start_default, end_default = staff_mod.month_range(month)
+        q1, q2, q3 = st.columns([2, 1, 1])
+        companies = q1.multiselect("Companies (pick several)", company_options, accept_new_options=True, key="staff_company",
+                                   placeholder="Pick, or type text that appears in the bank memo")
+        from_date = q2.date_input("From", value=date.fromisoformat(start_default), key=f"staff_from_{month}")
+        to_date = q3.date_input("To", value=date.fromisoformat(end_default), key=f"staff_to_{month}")
+        v1, v2, v3, _ = st.columns([2.2, 1, 1, 3])
+        if v1.button(f"Auto-fill {month} from {staff_mod.previous_month(month)}", key="staff_rev_autofill",
+                     help="Picks this month's deposits for every company you picked last month."):
+            with db.connect(DB_PATH) as connection:
+                result = staff_mod.autofill_revenue(connection, business_id, month)
+            if not result["companies"]:
+                st.info(f"No revenue was picked for {staff_mod.previous_month(month)}, so there is nothing to fill from.")
+            else:
+                st.success(f"Picked {result['added']} deposit{'s' if result['added'] != 1 else ''} for {month}."
+                           + (f" Nothing found yet for: {', '.join(result['no_match'])}." if result["no_match"] else ""))
+        v2.button("← Previous", key="staff_rev_prev_month", on_click=shift_staff_month, args=(-1,))
+        v3.button("Next month →", key="staff_rev_next_month", on_click=shift_staff_month, args=(1,), type="primary")
+        st.caption("Deposits whose description, name or check payee contains the company. Tick the ones that are revenue from it.")
+        if companies:
+            found, seen = [], set()
+            with db.connect(DB_PATH) as connection:
+                for company in companies:
+                    for t in staff_mod.revenue_candidates(connection, business_id, company, from_date.isoformat(), to_date.isoformat()):
+                        if t["id"] not in seen:
+                            seen.add(t["id"])
+                            found.append({**t, "company": company})
+            if not found:
+                st.info("No deposits found for those companies in this period. Widen the dates or try a shorter piece of the name.")
+            else:
+                pick_frame = pd.DataFrame([{
+                    "id": t["id"], "Include": True, "Company": t["company"], "Date": t["transaction_date"],
+                    "Amount": t["signed_amount"], "Description": t["description"], "Memo / note": t["memo"],
+                    "Category": t["category"] or "", "Treatment": t["treatment"]} for t in found])
+                edited = st.data_editor(
+                    pick_frame, hide_index=True, width="stretch",
+                    key=f"staff_rev_{'|'.join(companies)}_{from_date}_{to_date}",
+                    column_order=["Include", "Company", "Date", "Amount", "Description", "Memo / note", "Category", "Treatment"],
+                    disabled=["Company", "Date", "Amount", "Description", "Memo / note", "Category", "Treatment"],
+                    column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+                chosen = edited[edited["Include"]]
+                t1, t2 = st.columns(2)
+                t1.metric("Revenue picked", money(float(chosen["Amount"].sum())))
+                t2.metric("Deposits", f"{len(chosen)} of {len(edited)}")
+                if len(companies) > 1:
+                    st.dataframe(chosen.groupby("Company", as_index=False)["Amount"].sum().rename(columns={"Amount": "Total"}),
+                                 hide_index=True, width="stretch",
+                                 column_config={"Total": st.column_config.NumberColumn(format="$%.2f")})
+                if st.button("Save picks", type="primary", key="staff_rev_save"):
+                    with db.connect(DB_PATH) as connection:
+                        for company in companies:
+                            shown = [int(r["id"]) for _, r in edited.iterrows() if r["Company"] == company]
+                            keep = [int(r["id"]) for _, r in chosen.iterrows() if r["Company"] == company]
+                            if shown:
+                                staff_mod.save_revenue_picks(connection, business_id, company, shown, keep)
+                    st.success("Saved. These now show in the Monthly summary.")
+        with db.connect(DB_PATH) as connection:
+            saved = staff_mod.revenue_by_month(connection, business_id)
+        if saved:
+            section_label("Saved revenue by company and month")
+            st.dataframe(pd.DataFrame([{"Month": r["month"], "Company": r["company"], "Deposits": r["deposits"],
+                                        "Revenue": r["total"]} for r in saved]), hide_index=True, width="stretch",
+                         column_config={"Revenue": st.column_config.NumberColumn(format="$%.2f")})
+
+    with tab_sum:
+        ascending = sorted(month_options)
+        end_default = month if month in ascending else ascending[-1]
+        start_index = max(ascending.index(end_default) - 5, 0)
+        sm1, sm2, sm3 = st.columns([1, 1, 1.4])
+        sum_from = sm1.selectbox("From month", ascending, index=start_index, key="staff_sum_from")
+        sum_to = sm2.selectbox("To month", ascending, index=ascending.index(end_default), key="staff_sum_to")
+        show_what = sm3.radio("Show", ["Both", "Staff paid", "Revenue"], horizontal=True, key="staff_sum_show")
+        if sum_from > sum_to:
+            st.warning("The From month is after the To month.")
+        else:
+            with db.connect(DB_PATH) as connection:
+                all_paid = staff_mod.paid_detail(connection, business_id, sum_from, sum_to)
+                all_revenue = staff_mod.revenue_detail(connection, business_id, sum_from, sum_to)
+            f1, f2 = st.columns(2)
+            staff_pick = f1.multiselect("Staff (empty = everyone)", sorted({r["name"] for r in all_paid}, key=str.lower),
+                                        key="staff_sum_staff", disabled=show_what == "Revenue")
+            company_pick = f2.multiselect("Revenue companies (empty = all)", sorted({r["name"] for r in all_revenue}, key=str.lower),
+                                          key="staff_sum_companies", disabled=show_what == "Staff paid")
+            paid_rows = [r for r in all_paid if show_what != "Revenue" and (not staff_pick or r["name"] in staff_pick)]
+            revenue_rows = [r for r in all_revenue if show_what != "Staff paid" and (not company_pick or r["name"] in company_pick)]
+            months_list = staff_mod.months_between(sum_from, sum_to)
+            by_month = pd.DataFrame({"Month": months_list})
+            by_month["Paid to staff"] = by_month["Month"].map(
+                lambda m: round(sum(r["total"] for r in paid_rows if r["month"] == m), 2))
+            by_month["Revenue"] = by_month["Month"].map(
+                lambda m: round(sum(r["total"] for r in revenue_rows if r["month"] == m), 2))
+            by_month["Margin"] = (by_month["Revenue"] - by_month["Paid to staff"]).round(2)
+            totals_paid, totals_revenue = by_month["Paid to staff"].sum(), by_month["Revenue"].sum()
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Paid to staff", money(float(totals_paid)))
+            k2.metric("Revenue", money(float(totals_revenue)))
+            k3.metric("Margin", money(float(totals_revenue - totals_paid)))
+            shown_columns = {"Both": ["Month", "Paid to staff", "Revenue", "Margin"],
+                             "Staff paid": ["Month", "Paid to staff"], "Revenue": ["Month", "Revenue"]}[show_what]
+            money_config = {c: st.column_config.NumberColumn(format="$%.2f") for c in ("Paid to staff", "Revenue", "Margin")}
+            st.dataframe(by_month[shown_columns], hide_index=True, width="stretch", column_config=money_config)
+
+            def pivot(rows: list[dict], label: str) -> pd.DataFrame:
+                table = pd.DataFrame(rows).pivot_table(index="name", columns="month", values="total", aggfunc="sum",
+                                                       fill_value=0.0).reindex(columns=months_list, fill_value=0.0)
+                table["Total"] = table.sum(axis=1)
+                table.loc["All"] = table.sum()
+                table.index.name = label
+                return table.reset_index()
+
+            for rows, label in ((paid_rows, "Staff or company"), (revenue_rows, "Revenue company")):
+                if rows:
+                    section_label("Paid to " + "each person" if label.startswith("Staff") else "Revenue by company")
+                    table = pivot(rows, label)
+                    st.dataframe(table, hide_index=True, width="stretch",
+                                 column_config={c: st.column_config.NumberColumn(format="$%.2f") for c in table.columns if c != label})
+                    csv_download("Download CSV", table, f"{'staff-paid' if label.startswith('Staff') else 'revenue'}-{sum_from}-to-{sum_to}",
+                                 key=f"staff_sum_csv_{label}")
+            if not paid_rows and not revenue_rows:
+                st.info("Nothing in this period for the selection.")
+            st.caption("Revenue counts only the deposits you picked and saved. Paid to staff is the amounts you entered.")
+
 elif page == "Parties":
     page_header("Everyone you do business with",
                 "Lenders, borrowers, customers and payees in one list. Rename a party everywhere or merge duplicate spellings.",
@@ -2361,7 +3346,7 @@ elif page == "Parties":
 
 elif page == "Categories & Rules":
     page_header("Your accounting vocabulary",
-                "Categories organize reporting. Learned rules quietly handle repeat descriptions and remain fully editable.",
+                "Categories and rules belong to the business you have selected. Learned rules handle repeat descriptions, and you can edit or clean them up. To copy a setup to another business, use Admin & backup.",
                 "Automation library")
     left, right = st.columns([1, 2])
     with left:
@@ -2407,6 +3392,39 @@ elif page == "Categories & Rules":
         with db.connect(DB_PATH) as connection:
             rules = db.list_rules(connection, business_id)
         if rules:
+            with db.connect(DB_PATH) as connection:
+                clutter = db.rule_cleanup_candidates(connection, business_id)
+            if clutter:
+                with st.expander(f"Clean up: {len(clutter)} rule(s) that are probably clutter"):
+                    st.caption("One-off check-number rules, loan rules on generic bank text, and switched-off unused rules. "
+                               "Deleting a rule never changes transactions it already classified. "
+                               "Bank-text rules on the Parties page are not listed here.")
+                    clutter_frame = pd.DataFrame([{
+                        "Delete": True, "Why": c["reason"], "Phrase": c["pattern"], "Account": c["account_name"] or "All accounts",
+                        "Treatment": c["treatment"], "Category": c["category_name"] or ""} for c in clutter])
+                    clutter_frame.index = [c["id"] for c in clutter]
+                    picked_clutter = st.data_editor(clutter_frame, key="rule_cleanup_editor", width="stretch",
+                                                    disabled=["Why", "Phrase", "Account", "Treatment", "Category"])
+                    to_delete = [int(i) for i, r in picked_clutter.iterrows() if r["Delete"]]
+                    if st.button(f"Delete {len(to_delete)} ticked rule(s)", type="primary", disabled=not to_delete,
+                                 key="rule_cleanup_apply"):
+                        with db.connect(DB_PATH) as connection:
+                            removed = db.delete_rules(connection, business_id, to_delete)
+                        st.success(f"Deleted {removed} rule(s).")
+                        rerun()
+            f1, f2, f3 = st.columns([2, 1.3, 1])
+            rule_search = f1.text_input("Search rules", key="rule_search", placeholder="Phrase or category…")
+            rule_treatment = f2.selectbox("Treatment", ["All"] + list(db.TREATMENTS[:-1]), key="rule_treatment_filter")
+            rule_state = f3.selectbox("Show", ["All", "Active", "Off"], key="rule_state_filter")
+            needle = rule_search.strip().lower()
+            rules = [r for r in rules
+                     if (not needle or needle in r["pattern"].lower() or needle in (r["category_name"] or "").lower())
+                     and (rule_treatment == "All" or r["treatment"] == rule_treatment)
+                     and (rule_state == "All" or bool(r["active"]) == (rule_state == "Active"))]
+            st.caption(f"{len(rules):,} rule(s) shown")
+            if not rules:
+                st.info("No rules match these filters.")
+                st.stop()
             st.dataframe(pd.DataFrame(rules)[["id", "pattern", "account_name", "category_name", "treatment", "hit_count", "active"]],
                          hide_index=True, width="stretch")
             rule_ids = {f"#{item['id']} · {item['pattern'][:70]}{' · off' if not item['active'] else ''}": item for item in rules}

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from books import db, importers, statements
+from books import db, importers, loc, statements
 
 
 class BooksTests(unittest.TestCase):
@@ -884,6 +884,47 @@ class BooksTests(unittest.TestCase):
             self.assertEqual(db.set_loan_notes(connection, self.business + 99,
                              [{"kind": "transaction", "id": txn[0], "notes": "x"}]), 0)
 
+
+    def test_loc_statement_reconcile(self):
+        with db.connect(self.path) as c:
+            line = db.get_or_create_account(c, self.business, "Test LOC", "line_of_credit")
+            def bank(date, desc, amount):
+                return db.insert_transaction(c, business_id=self.business, account_id=self.account,
+                    transaction_date=date, posting_date=None, description=desc, source_amount=amount,
+                    signed_amount=amount)[0]
+            pay = bank("2026-03-05", "ONLINE PMT LOC", -1000)
+            draw = bank("2026-03-10", "LOC ADVANCE", 5000)
+            other = bank("2026-03-12", "SOMETHING ELSE", -77)
+            rows = importers.parse_csv_text(
+                "Date,Description,Amount\n03/04/2026,Payment Thank You,1000.00\n"
+                "03/02/2026,Interest Charge,-60.00\n03/10/2026,Advance,-5000.00\n")
+            rows = loc.orient(rows)
+            self.assertEqual([r["kind"] for r in rows], ["payment", "interest", "advance"])
+            self.assertEqual([r["signed_amount"] for r in rows], [-1000.0, -60.0, 5000.0])
+            saved = loc.import_rows(c, business_id=self.business, account_id=line, rows=rows, source_name="loc.csv")
+            self.assertEqual(saved["imported"], 3)
+            outcome = loc.reconcile(c, self.business, line)
+            self.assertEqual(outcome["matched"], 2)
+            self.assertEqual(outcome["split"], 1)
+            kids = c.execute("SELECT treatment, signed_amount FROM transactions WHERE split_parent_id = ? ORDER BY id", (pay,)).fetchall()
+            self.assertEqual([(k["treatment"], k["signed_amount"]) for k in kids],
+                             [("Principal repayment", -940.0), ("Expense", -60.0)])
+            d = c.execute("SELECT treatment, related_account_id FROM transactions WHERE id = ?", (draw,)).fetchone()
+            self.assertEqual((d["treatment"], d["related_account_id"]), ("Loan draw", line))
+            self.assertEqual(c.execute("SELECT treatment FROM transactions WHERE id = ?", (other,)).fetchone()[0], "Needs review")
+            # interest is expensed once: the statement interest line is mirrored, not counted again
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM transactions WHERE account_id = ? AND treatment = 'Expense'", (line,)).fetchone()[0], 0)
+            self.assertEqual(loc.reconcile(c, self.business, line)["matched"], 0)
+
+    def test_ask_partial_category(self):
+        from books import ask
+        cats = ["Software and subscriptions", "Business Gas", "Travel - Gas", "Loan", "Loan repayment"]
+        self.assertEqual(ask.parse("software and subscriptions", cats, []).category_names, ["Software and subscriptions"])
+        self.assertEqual(ask.parse("soft", cats, []).category_names, ["Software and subscriptions"])
+        self.assertEqual(ask.parse("gas 2026", cats, []).category_names, ["Business Gas", "Travel - Gas"])
+        self.assertEqual(ask.parse("loan repayment", cats, []).category_names, ["Loan repayment"])
+        vendor = ask.parse("makesh payments", cats, [])
+        self.assertEqual((vendor.category_names, vendor.terms), ([], ["makesh"]))
 
     def test_summary_and_mileage(self):
         from books import mileage, summary

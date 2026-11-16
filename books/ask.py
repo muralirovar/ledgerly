@@ -65,6 +65,8 @@ class Query:
     group_by: str = ""
     all_businesses: bool = False
     category: str = ""
+    category_names: list[str] = field(default_factory=list)
+    category_words: list[str] = field(default_factory=list)
     treatments: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -157,17 +159,51 @@ def parse(question: str, categories: list[str] | None = None, business_names: li
             query.terms.append(name.lower())
             text = text.replace(name.lower(), " ")
 
+    # a category named in full wins, unless it is only part of a longer treatment phrase ("loan receivable")
+    def inside_treatment_phrase(name: str) -> bool:
+        for pattern, _ in TREATMENT_PHRASES:
+            found = re.search(rf"\b{pattern}\b", text)
+            if found and name.lower() in found.group(0) and len(found.group(0)) > len(name):
+                return True
+        return False
+
+    for name in sorted(categories or [], key=len, reverse=True):
+        if len(name) >= 3 and name.lower() in text and not inside_treatment_phrase(name):
+            query.category = name
+            query.category_names = [other for other in (categories or []) if other.lower() == name.lower()][:1]
+            text = text.replace(name.lower(), " ")
+            break
+
     # treatments named outright (loan draw, internal transfer, owner draw ...)
     for pattern, names in TREATMENT_PHRASES:
         if take(rf"\b{pattern}\b"):
             query.treatments += [name for name in names if name not in query.treatments]
 
-    # categories mentioned
-    for name in sorted(categories or [], key=len, reverse=True):
-        if len(name) >= 4 and name.lower() in text:
-            query.category = name
-            text = text.replace(name.lower(), " ")
-            break
+    # a part of a category name: every leftover word must belong to the same category (gas, fee, soft, "it staffing")
+    if not query.category and categories:
+        words = [w for w in re.findall(r"[a-z0-9]+", text) if w not in STOPWORDS and w not in KIND_WORDS]
+        if words:
+            def word_hits(word: str, name_words: list[str]) -> bool:
+                stem = word[:-1] if len(word) > 3 and word.endswith("s") else word
+                for nw in name_words:
+                    if nw == word or nw == stem:
+                        return True
+                    if len(word) >= 3 and (nw.startswith(word) or nw.startswith(stem)):
+                        return True
+                    if len(word) >= 4 and word in nw:
+                        return True
+                return False
+            found = []
+            for name in categories:
+                name_words = re.findall(r"[a-z0-9]+", name.lower())
+                if all(word_hits(w, name_words) for w in words) and name not in found:
+                    found.append(name)
+            if 0 < len(found) <= 10:
+                query.category_names = found
+                query.category = found[0] if len(found) == 1 else f"{len(found)} matching categories"
+                query.category_words = words
+                for w in words:
+                    text = re.sub(rf"\b{re.escape(w)}\b", " ", text, count=1)
 
     # kind words
     for word in re.findall(r"[a-z]+", text):
@@ -249,9 +285,9 @@ def run(connection: sqlite3.Connection, query: Query, business_id: int | None, l
     if query.max_amount is not None:
         where.append("ABS(t.signed_amount) <= ?")
         params.append(query.max_amount)
-    if query.category:
-        where.append("LOWER(COALESCE(c.name, '')) = LOWER(?)")
-        params.append(query.category)
+    if query.category_names:
+        where.append(f"LOWER(COALESCE(c.name, '')) IN ({','.join('?' * len(query.category_names))})")
+        params += [name.lower() for name in query.category_names]
     if query.check_number:
         where.append("EXISTS (SELECT 1 FROM check_register r WHERE r.transaction_id = t.id AND r.check_number = ?)")
         params.append(query.check_number.lstrip("0") or "0")
@@ -282,6 +318,10 @@ def run(connection: sqlite3.Connection, query: Query, business_id: int | None, l
             if all(term in haystack for term in wanted):
                 kept.append(row)
         rows = kept
+    if not rows and query.category_names and query.category_words:
+        from dataclasses import replace
+        return run(connection, replace(query, category="", category_names=[], category_words=[],
+                                       terms=query.category_words + query.terms), business_id, limit)
     for row in rows:
         row["Check"] = row.pop("Check_info") or ""
     return rows[:limit]

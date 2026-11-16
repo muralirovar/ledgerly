@@ -11,7 +11,7 @@ import hmac
 import pandas as pd
 import streamlit as st
 
-from books import ai_config, ask as ask_mod, backup, mileage as mileage_mod, summary as summary_mod, db, documents, exporter, importers, statements
+from books import ai_config, ask as ask_mod, backup, loc as loc_mod, mileage as mileage_mod, summary as summary_mod, db, documents, exporter, importers, statements
 from books import staff as staff_mod
 
 
@@ -983,7 +983,7 @@ if page == "Dashboard":
 
     dash_ids = [int(b["id"]) for b in businesses] if all_businesses else [business_id]
     business_name_by_id = {int(b["id"]): b["name"] for b in businesses}
-    dash_loans, dash_vendors = [], []
+    dash_loans, dash_vendors, dash_categories = [], [], []
     dash_loan_problems = 0
     with db.connect(DB_PATH) as connection:
         for dash_id in dash_ids:
@@ -991,8 +991,10 @@ if page == "Dashboard":
                 dash_loans.append({"business": business_name_by_id[dash_id], **row})
             for row in db.vendor_report(connection, dash_id):
                 dash_vendors.append({"Business": business_name_by_id[dash_id], **row})
+            for row in db.category_summary(connection, dash_id):
+                dash_categories.append(row)
             dash_loan_problems += len(db.loan_direction_problems(connection, dash_id))
-    section_label("Revenue and expense by vendor")
+    section_label("Revenue by vendor and expense by category")
     if dash_vendors:
         vendor_dash = pd.DataFrame(dash_vendors).rename(columns={
             "party": "Vendor / party", "revenue": "Revenue", "expense": "Expense", "net": "Net",
@@ -1004,17 +1006,32 @@ if page == "Dashboard":
         else:
             vendor_dash = vendor_dash.drop(columns=["Business"])
         top_n = st.slider("Vendors to show", 5, 100, 25, key="dash_vendor_count_25")
-        for title, column in (("Revenue by vendor", "Revenue"), ("Expense by vendor", "Expense")):
-            ranked = vendor_dash[vendor_dash[column] > 0].sort_values(column, ascending=False)
-            shown = ranked.head(top_n)
-            st.markdown(f"**{title}** · top {len(shown)} of {len(ranked)} · total {money(float(ranked[column].sum()))}"
-                        f" · shown {money(float(shown[column].sum()))}")
-            if shown.empty:
-                st.caption(f"No {column.lower()} recorded yet.")
-            else:
-                st.dataframe(shown[["Vendor / party", column, "Transactions", "Last activity"]], hide_index=True, width="stretch",
-                             height=min(35 * (len(shown) + 1) + 3, 940),
-                             column_config={column: st.column_config.NumberColumn(format="$%.2f")})
+        ranked = vendor_dash[vendor_dash["Revenue"] > 0].sort_values("Revenue", ascending=False)
+        shown = ranked.head(top_n)
+        st.markdown(f"**Revenue by vendor** · top {len(shown)} of {len(ranked)} · total {money(float(ranked['Revenue'].sum()))}"
+                    f" · shown {money(float(shown['Revenue'].sum()))}")
+        if shown.empty:
+            st.caption("No revenue recorded yet.")
+        else:
+            st.dataframe(shown[["Vendor / party", "Revenue", "Transactions", "Last activity"]], hide_index=True,
+                         width="stretch", height=min(35 * (len(shown) + 1) + 3, 940),
+                         column_config={"Revenue": st.column_config.NumberColumn(format="$%.2f")})
+        category_dash = pd.DataFrame(dash_categories)
+        if not category_dash.empty:
+            category_dash = category_dash.rename(columns={"category": "Category", "expense": "Expense",
+                                                          "transactions": "Transactions"})
+            category_dash = category_dash.groupby("Category", as_index=False).agg(
+                Expense=("Expense", "sum"), Transactions=("Transactions", "sum"))
+        ranked = (category_dash[category_dash["Expense"] > 0].sort_values("Expense", ascending=False)
+                  if not category_dash.empty else category_dash)
+        st.markdown(f"**Expense by category** · {len(ranked)} categories · total "
+                    f"{money(float(ranked['Expense'].sum())) if len(ranked) else money(0)}")
+        if len(ranked):
+            st.dataframe(ranked[["Category", "Expense", "Transactions"]], hide_index=True, width="stretch",
+                         height=min(35 * (len(ranked) + 1) + 3, 940),
+                         column_config={"Expense": st.column_config.NumberColumn(format="$%.2f")})
+        else:
+            st.caption("No expense recorded yet.")
         st.button("▥  Open vendor report", on_click=go_to, args=("▥  Reports",), key="dash_to_vendor")
     else:
         st.caption("No revenue or expense recorded yet.")
@@ -1230,35 +1247,78 @@ elif page == "Import / Paste":
                 "Upload a statement or paste only the rows you need. Nothing is committed until you approve the preview.",
                 "Import center")
     with db.connect(DB_PATH) as connection:
-        accounts = [item for item in db.list_accounts(connection, business_id) if item["account_type"] != "line_of_credit"]
+        accounts = list(db.list_accounts(connection, business_id))
     if not accounts:
         st.warning("Add a checking or credit-card account first on Accounts & Credit.")
         st.stop()
     account_by_name = {item["name"]: item for item in accounts}
     selected_account_name = st.selectbox("Account", list(account_by_name))
     selected_account = account_by_name[selected_account_name]
+    is_loc = selected_account["account_type"] == "line_of_credit"
     mode = st.radio("Input", ["Upload CSV", "Paste rows"], horizontal=True)
     text = ""
+    pdf_bytes = None
     source_name = "pasted-rows.csv"
     if mode == "Upload CSV":
-        upload = st.file_uploader("Choose a bank CSV", type=["csv"])
+        upload = st.file_uploader("Choose a statement (CSV or PDF)" if is_loc else "Choose a bank CSV",
+                                  type=["csv", "pdf"] if is_loc else ["csv"])
         if upload:
             source_name = upload.name
-            text = upload.getvalue().decode("utf-8-sig")
+            if upload.name.lower().endswith(".pdf"):
+                pdf_bytes = upload.getvalue()
+            else:
+                text = upload.getvalue().decode("utf-8-sig")
     else:
         st.caption("Paste CSV or tab-separated rows. Include Date, Description, Amount.")
         pasted = st.text_area("Rows", height=220, placeholder="Date\tDescription\tAmount\n11/11/2026\tExample\t-25.00")
         text = pasted.replace("\t", ",")
 
+    payments_are = "auto"
+    if is_loc:
+        choice = st.radio("In this statement, payments to the line of credit are shown as",
+                          ["Detect automatically", "Positive numbers", "Negative numbers"], horizontal=True)
+        payments_are = {"Positive numbers": "positive", "Negative numbers": "negative"}.get(choice, "auto")
+        st.caption("Advances become loan draws, payments become principal repayments, and interest and fees become "
+                   "expense. Lines that match a checking transaction of the same amount are reconciled automatically.")
     preview_key = f"preview_{business_id}_{selected_account['id']}"
-    if st.button("Preview", disabled=not bool(text.strip()), type="primary"):
+    if st.button("Preview", disabled=not (bool(text.strip()) or pdf_bytes), type="primary"):
         try:
-            st.session_state[preview_key] = importers.preview_csv(text, selected_account["account_type"])
+            if is_loc:
+                parsed_rows = loc_mod.parse_pdf(pdf_bytes) if pdf_bytes else importers.parse_csv_text(text)
+                if not parsed_rows:
+                    raise ValueError("No transaction lines found. Paste or upload rows with Date, Description and Amount.")
+                st.session_state[preview_key] = loc_mod.orient(parsed_rows, payments_are)
+            else:
+                st.session_state[preview_key] = importers.preview_csv(text, selected_account["account_type"])
             st.session_state[preview_key + "_name"] = source_name
         except Exception as exc:
             st.error(str(exc))
     preview = st.session_state.get(preview_key, [])
-    if preview:
+    if preview and is_loc:
+        section_label(f"Preview · {len(preview)} statement lines")
+        shown = pd.DataFrame(preview)[["transaction_date", "description", "kind", "source_amount", "signed_amount"]]
+        shown.columns = ["Date", "Description", "Type", "Statement amount", "Cash view"]
+        st.dataframe(shown, hide_index=True, width="stretch")
+        st.caption("Cash view: borrowed money is positive; payments, interest and fees are negative.")
+        if st.button("Import and reconcile with checking", type="primary"):
+            with db.connect(DB_PATH) as connection:
+                saved = loc_mod.import_rows(connection, business_id=business_id,
+                                            account_id=int(selected_account["id"]), rows=preview,
+                                            source_name=st.session_state.get(preview_key + "_name", source_name))
+                outcome = loc_mod.reconcile(connection, business_id, int(selected_account["id"]))
+            st.success(f"Imported {saved['imported']} lines; skipped {saved['duplicates']} duplicates. "
+                       f"Matched {outcome['matched']} to checking; interest booked as expense on "
+                       f"{outcome['interest_expensed']} payment(s).")
+            if outcome["matches"]:
+                st.dataframe(pd.DataFrame([{
+                    "Statement date": m["loc"]["transaction_date"], "Statement line": m["loc"]["description"],
+                    "Amount": m["loc"]["signed_amount"], "Checking date": m["bank"]["transaction_date"],
+                    "Checking description": m["bank"]["description"], "Interest expense": m["interest"],
+                    "Principal": round(abs(m["bank"]["signed_amount"]) - m["interest"], 2)
+                    if m["loc"]["treatment"] == "Principal repayment" else abs(m["bank"]["signed_amount"]),
+                } for m in outcome["matches"]]), hide_index=True, width="stretch")
+            del st.session_state[preview_key]
+    elif preview:
         section_label(f"Preview · {len(preview)} rows")
         st.dataframe(pd.DataFrame(preview)[["transaction_date", "description", "source_amount", "signed_amount"]],
                      hide_index=True, width="stretch")
@@ -1272,6 +1332,12 @@ elif page == "Import / Paste":
             st.success(f"Imported {result['imported']}; skipped {result['duplicates']} duplicates; "
                        f"auto-classified {result['auto_classified']}; {result['needs_review']} need review.")
             del st.session_state[preview_key]
+
+    if is_loc and st.button("Reconcile this line of credit with checking again"):
+        with db.connect(DB_PATH) as connection:
+            outcome = loc_mod.reconcile(connection, business_id, int(selected_account["id"]))
+        st.success(f"Matched {outcome['matched']} statement lines to checking; interest booked as expense on "
+                   f"{outcome['interest_expensed']} payment(s).")
 
     st.divider()
     section_label("Import history")

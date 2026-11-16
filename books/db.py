@@ -1956,6 +1956,57 @@ def excluded_from_pnl(
     return rows
 
 
+def _vendor_party(r: Any, mappings: list[tuple[str, str]], names: dict[str, str]) -> str:
+    party = (r["counterparty"] or "").strip()
+    if party:
+        return names.get(_payee_key(party), party)
+    text = r["normalized_description"] or normalize_description(r["description"])
+    party = next((name for pattern, name in mappings if pattern and pattern in text), "")
+    if not party:
+        words = suggested_vendor_pattern(r["description"]).split()
+        while len(words) > 1 and re.fullmatch(r"[#*]?\d[\w-]*", words[-1]):
+            words.pop()  # reference numbers should not split one vendor into many
+        party = " ".join(words).title() or "(Unknown)"
+    return party
+
+
+def vendor_1099_report(connection: sqlite3.Connection, business_id: int, start: str, end: str,
+                       category_names: list[str]) -> list[dict[str, Any]]:
+    """Money paid to each vendor in the chosen expense categories, for 1099 reporting.
+
+    Card payments are shown apart from bank payments: card payments are reported by the card
+    processor (Form 1099-K), so a 1099-NEC / 1099-MISC normally covers only the bank amount.
+    """
+    if not category_names:
+        return []
+    mappings = [(normalize_description(v["match_pattern"]), v["name"]) for v in connection.execute(
+        "SELECT name, match_pattern FROM vendors WHERE business_id = ? AND active = 1", (business_id,))]
+    mappings.sort(key=lambda m: -len(m[0]))
+    names = _party_display(connection, business_id)
+    marks = ",".join("?" for _ in category_names)
+    totals: dict[str, dict[str, Any]] = {}
+    for r in connection.execute(
+        f"""SELECT t.description, t.normalized_description, t.counterparty, t.signed_amount, t.treatment,
+                   t.transaction_date, a.account_type, c.name AS category
+            FROM transactions t JOIN categories c ON c.id = t.category_id JOIN accounts a ON a.id = t.account_id
+            WHERE t.business_id = ? AND t.status != 'split' AND t.treatment IN ('Expense', 'Expense refund')
+              AND t.transaction_date BETWEEN ? AND ? AND LOWER(c.name) IN ({marks})
+            ORDER BY t.transaction_date""",
+        [business_id, start, end, *[n.lower() for n in category_names]]):
+        party = _vendor_party(r, mappings, names)
+        item = totals.setdefault(party, {"bank": 0.0, "card": 0.0, "n": 0, "first": r["transaction_date"],
+                                         "last": "", "categories": set()})
+        amount = abs(float(r["signed_amount"])) * (1 if r["treatment"] == "Expense" else -1)
+        item["card" if r["account_type"] == "credit_card" else "bank"] += amount
+        item["n"] += 1
+        item["last"] = max(item["last"], r["transaction_date"])
+        item["categories"].add(r["category"])
+    rows = [{"vendor": p, "categories": ", ".join(sorted(v["categories"])), "paid_bank": round(v["bank"], 2),
+             "paid_card": round(v["card"], 2), "total": round(v["bank"] + v["card"], 2), "payments": v["n"],
+             "first_payment": v["first"], "last_payment": v["last"]} for p, v in totals.items()]
+    return sorted(rows, key=lambda x: -x["total"])
+
+
 def vendor_report(
     connection: sqlite3.Connection, business_id: int, start: str | None = None, end: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -1975,17 +2026,7 @@ def vendor_report(
             FROM transactions t WHERE t.business_id = ?
               AND t.treatment IN ('Revenue','Revenue refund','Expense','Expense refund'){clause}""",
         [business_id, *extra]):
-        party = (r["counterparty"] or "").strip()
-        if party:
-            party = names.get(_payee_key(party), party)
-        else:
-            text = r["normalized_description"] or normalize_description(r["description"])
-            party = next((name for pattern, name in mappings if pattern and pattern in text), "")
-            if not party:
-                words = suggested_vendor_pattern(r["description"]).split()
-                while len(words) > 1 and re.fullmatch(r"[#*]?\d[\w-]*", words[-1]):
-                    words.pop()  # reference numbers should not split one vendor into many
-                party = " ".join(words).title() or "(Unknown)"
+        party = _vendor_party(r, mappings, names)
         item = totals.setdefault(party, {"revenue": 0.0, "expense": 0.0, "transactions": 0, "last": ""})
         amount = float(r["signed_amount"])
         if r["treatment"] in ("Revenue", "Revenue refund"):

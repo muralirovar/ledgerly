@@ -2445,6 +2445,10 @@ elif page == "Transactions":
                     rerun()
 
     window_mode = True
+    _pick_state = st.session_state.get("txn_pick_grid")
+    _has_pick = bool(_pick_state and _pick_state.get("selection", {}).get("rows")) if hasattr(_pick_state, "get") else False
+    edit_again = r3.button("✎  Edit", key="txn_edit_button", disabled=not _has_pick,
+                           help="Tick the box at the left of a row to open it in a window. Use this to reopen the ticked row after closing.")
     if window_mode:
         pick_columns = ["id", "transaction_date", "description", "signed_amount", "Debit / Credit", "category",
                         "treatment", "From", "To", "counterparty", "status", "Split", "notes", "account"]
@@ -2455,7 +2459,7 @@ elif page == "Transactions":
             st.session_state["txn_pick_seen"] = None
         pick_grid = st.dataframe(
             filtered[pick_columns].rename(columns={"id": "#"}), hide_index=True, width="stretch", height=650,
-            on_select="rerun", selection_mode=["single-cell", "single-row"], key="txn_pick_grid",
+            on_select="rerun", selection_mode="single-row", key="txn_pick_grid",
             column_config={"signed_amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
                            "description": st.column_config.TextColumn(width="large")})
 
@@ -2682,17 +2686,13 @@ elif page == "Transactions":
                 close_txn_dialog()
                 st.rerun()
 
-        picked_position = (pick_grid.selection.cells[0][0] if pick_grid.selection.cells
-                           else pick_grid.selection.rows[0] if pick_grid.selection.rows else None)
+        picked_position = pick_grid.selection.rows[0] if pick_grid.selection.rows else None
         if picked_position is not None:
             picked = int(filtered.iloc[picked_position]["id"])
-            seen = picked
-            if st.session_state.get("txn_pick_seen") != seen:
-                st.session_state["txn_pick_seen"] = seen
+            if st.session_state.get("txn_pick_seen") != picked or edit_again:
+                st.session_state["txn_pick_seen"] = picked
                 st.session_state["txn_dialog_id"] = picked
-                edit_transaction_dialog()
-            elif st.session_state.get("txn_dialog_id"):
-                edit_transaction_dialog()
+            edit_transaction_dialog()
         elif st.session_state.get("txn_dialog_id"):
             edit_transaction_dialog()
         if st.session_state.get("txn_saved_message"):
@@ -2844,7 +2844,7 @@ elif page == "Reports":
                 "Loan positions by party, everything kept out of profit and loss, and revenue and expense by vendor or party.",
                 "Reports")
     r_start, r_end = period_picker("reports")
-    tab_loans, tab_excluded, tab_vendor, tab_margin = st.tabs(["Loans", "Excluded from P&L", "By vendor / party", "Margin"])
+    tab_loans, tab_excluded, tab_vendor, tab_margin, tab_1099 = st.tabs(["Loans", "Excluded from P&L", "By vendor / party", "Margin", "1099 vendors"])
     with db.connect(DB_PATH) as connection:
         loan_rows = db.loan_report(connection, business_id, r_start, r_end)
         loan_ledger_rows = db.loan_ledger(connection, business_id, r_start, r_end)
@@ -3024,6 +3024,38 @@ elif page == "Reports":
             st.caption("The vendor is the party on the transaction, else the bank-text rule (Parties page) that matches it. "
                        "Loans, transfers and owner contributions are not included.")
             csv_download("Download vendor report (CSV)", vendor_frame, "revenue-expense-by-vendor", "dl_vendor_report")
+
+    with tab_1099:
+        with db.connect(DB_PATH) as connection:
+            all_cats = [c["name"] for c in db.list_categories(connection, business_id)]
+        guess = [n for n in all_cats if re.search(r"\bit\b.*serv|staffing", n.lower())
+                 and not re.search(r"revenue|refund", n.lower())]
+        x1, x2 = st.columns([1, 3])
+        year_1099 = x1.number_input("Tax year", 2020, 2100, int(date.today().year) - (1 if date.today().month < 7 else 0),
+                                    key="v1099_year")
+        chosen_cats = x2.multiselect("Expense categories", all_cats, default=guess, key="v1099_cats",
+                                     help="Categories whose payments to vendors are reported on a 1099. Pre-selected: IT services and staffing.")
+        with db.connect(DB_PATH) as connection:
+            rows_1099 = db.vendor_1099_report(connection, business_id, f"{int(year_1099)}-01-01",
+                                              f"{int(year_1099)}-12-31", chosen_cats)
+        if not rows_1099:
+            st.info("No expenses in those categories for that year.")
+        else:
+            frame_1099 = pd.DataFrame(rows_1099).rename(columns={
+                "vendor": "Vendor", "categories": "Categories", "paid_bank": "Paid by bank / check",
+                "paid_card": "Paid by card", "total": "Total paid", "payments": "Payments",
+                "first_payment": "First payment", "last_payment": "Last payment"})
+            frame_1099["1099 needed (bank ≥ $600)"] = frame_1099["Paid by bank / check"].apply(lambda v: "Yes" if v >= 600 else "No")
+            k1, k2, k3 = st.columns(3)
+            with k1: metric_card("Vendors", f"{len(frame_1099)}", f"{int((frame_1099.iloc[:, -1] == 'Yes').sum())} at $600 or more by bank", "▥", "navy")
+            with k2: metric_card("Paid by bank / check", money(float(frame_1099["Paid by bank / check"].sum())), "Reported on 1099-NEC", "↘", "rose")
+            with k3: metric_card("Paid by card", money(float(frame_1099["Paid by card"].sum())), "Reported by card processor", "▭", "gold")
+            st.dataframe(frame_1099, hide_index=True, width="stretch", column_config={
+                c: st.column_config.NumberColumn(format="$%.2f") for c in ("Paid by bank / check", "Paid by card", "Total paid")})
+            st.caption("The vendor is the party on the transaction, else the bank-text rule that matches it. Card payments are "
+                       "shown separately because the card processor reports them (1099-K). Taxpayer ID and address are not "
+                       "stored here; collect a W-9 from each vendor.")
+            csv_download("Download 1099 vendor list (CSV)", frame_1099, f"1099-vendors-{int(year_1099)}", "dl_1099")
 
     with tab_margin:
         with db.connect(DB_PATH) as connection:

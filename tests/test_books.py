@@ -926,6 +926,21 @@ class BooksTests(unittest.TestCase):
         vendor = ask.parse("makesh payments", cats, [])
         self.assertEqual((vendor.category_names, vendor.terms), ([], ["makesh"]))
 
+    def test_vendor_1099_report(self):
+        with db.connect(self.path) as c:
+            staffing = db.get_or_create_category(c, self.business, "IT Staffing Expense", "Expense")
+            card = db.get_or_create_account(c, self.business, "Card", "credit_card")
+            for account, amount, day in ((self.account, -500, "01"), (self.account, -400, "02"), (card, -50, "03")):
+                tid = db.insert_transaction(c, business_id=self.business, account_id=account,
+                    transaction_date=f"2026-03-{day}", posting_date=None, description=f"ACME STAFFING {day}",
+                    source_amount=amount, signed_amount=amount)[0]
+                db.classify_transaction(c, tid, category_id=staffing, treatment="Expense", pattern="NOPE")
+                c.execute("UPDATE transactions SET counterparty = 'Acme Staffing' WHERE id = ?", (tid,))
+            rows = db.vendor_1099_report(c, self.business, "2026-01-01", "2026-12-31", ["IT Staffing Expense"])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["vendor"], rows[0]["paid_bank"], rows[0]["paid_card"]), ("Acme Staffing", 900.0, 50.0))
+            self.assertEqual(db.vendor_1099_report(c, self.business, "2025-01-01", "2025-12-31", ["IT Staffing Expense"]), [])
+
     def test_summary_and_mileage(self):
         from books import mileage, summary
         with db.connect(self.path) as connection:

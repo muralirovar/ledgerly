@@ -219,7 +219,7 @@ def csv_download(label: str, frame: pd.DataFrame, file_stem: str, key: str) -> N
                        file_name=f"{db.slugify(business_name)}-{file_stem}.csv", mime="text/csv", key=key)
 
 
-def render_loan_balances(loan_rows: list[dict], show_business: bool = False) -> None:
+def render_loan_balances(loan_rows: list[dict], show_business: bool = False, equity: dict | None = None) -> None:
     """Two plain lists: who owes the business money, and who the business owes."""
     owed_to_us = sorted((r for r in loan_rows if r["owed_to_us"] > 0.004), key=lambda r: -r["owed_to_us"])
     we_owe = sorted((r for r in loan_rows if r["we_owe"] > 0.004), key=lambda r: -r["we_owe"])
@@ -245,6 +245,14 @@ def render_loan_balances(loan_rows: list[dict], show_business: bool = False) -> 
                          column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
         else:
             st.caption("We owe nobody anything.")
+        if equity and (equity["contributions"] or equity["draws"]):
+            st.markdown("**Owner equity** (not counted as owed)")
+            st.dataframe(pd.DataFrame([
+                {"Item": "Owner contributions (equity, not owed)", "Amount": equity["contributions"]},
+                {"Item": "Owner draws (taken out)", "Amount": equity["draws"]},
+                {"Item": "Net put in by owner", "Amount": round(equity["contributions"] - equity["draws"], 2)}]),
+                hide_index=True, width="stretch", column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            st.caption("To make an owner contribution count as a debt, change its treatment to Loan draw.")
     if odd:
         with st.expander(f"{len(odd)} part(s) need a look: repayments larger than the loan on record"):
             st.caption("Usually a loan that was never recorded, or a payment that is not really a loan repayment.")
@@ -1019,7 +1027,9 @@ if page == "Dashboard":
         w2.button("Fix them", on_click=go_to, args=("▥  Reports",), key="dash_fix_loans", type="primary",
                   help="Opens Reports. On the Loans tab, tick the fixes and press Apply.")
     if dash_loans:
-        render_loan_balances(dash_loans, show_business=all_businesses)
+        with db.connect(DB_PATH) as connection:
+            dash_equity = db.owner_equity(connection, dash_ids)
+        render_loan_balances(dash_loans, show_business=all_businesses, equity=dash_equity)
         st.button("▥  Open loan reports", on_click=go_to, args=("▥  Reports",), key="dash_to_loans")
     else:
         st.caption("No loan activity recorded yet.")
@@ -2272,7 +2282,7 @@ elif page == "Transactions":
                        else "Needs split" if int(linked or 0) >= 2 else "")
                       for status, parent, linked in zip(frame["status"], frame["split_parent_id"], frame["linked_checks"])]
     with st.expander("Filters: accounts, categories, treatment, status, dates, split", expanded=False):
-        f1, f2, f3, f4, f5 = st.columns(5)
+        f1, f2, f3, f4, f5, f6, f7 = st.columns([1, 1, 1, 1, .8, 1.25, 1])
         with f1:
             account_filters = st.multiselect("Accounts", sorted(frame["account"].dropna().unique()),
                                              placeholder="All accounts")
@@ -2291,10 +2301,9 @@ elif page == "Transactions":
             side_filters = st.multiselect("Debit / Credit", ["Debit", "Credit"], placeholder="Both")
         valid_dates = frame["transaction_date"].dropna()
         date_value = (valid_dates.min().date(), valid_dates.max().date()) if not valid_dates.empty else (date.today(), date.today())
-        dr1, dr2 = st.columns([2, 1])
-        selected_dates = dr1.date_input("Transaction date range", value=date_value)
-        split_filters = dr2.multiselect("Split status", ["Needs split", "🔒 Split original", "↳ Split line"],
-                                        placeholder="All transactions",
+        selected_dates = f6.date_input("Dates", value=date_value)
+        split_filters = f7.multiselect("Split", ["Needs split", "🔒 Split original", "↳ Split line"],
+                                        placeholder="All",
                                         help="Needs split: a bank transaction with 2 or more checks in the check register that "
                                              "hasn't been split yet. Split original: locked until its split is reverted. "
                                              "Split line: one of the lines a split created.")
@@ -2812,7 +2821,9 @@ elif page == "Reports":
                     rerun()
                 except Exception as exc:
                     st.error(str(exc))
-        render_loan_balances(loan_rows)
+        with db.connect(DB_PATH) as connection:
+            report_equity = db.owner_equity(connection, [business_id], r_start, r_end)
+        render_loan_balances(loan_rows, equity=report_equity)
         if not loan_rows:
             st.info("No loan activity in this period.")
         else:
@@ -3410,25 +3421,74 @@ elif page == "Mileage":
                 for kind, value in new_rates.items():
                     mileage_mod.set_rate(connection, int(mile_year), kind, value)
             rerun()
-    with st.form("mile_add", clear_on_submit=True, border=True):
-        a1, a2, a3, a4 = st.columns([1.2, 1, 1, 1])
-        trip_day = a1.date_input("Date", value=date.today())
-        trip_miles = a2.number_input("Miles", 0.0, 5000.0, 0.0, 0.1)
-        trip_kind = a3.selectbox("Type", list(mileage_mod.KINDS))
-        trip_purpose = a4.text_input("Purpose", placeholder="Client visit, bank, supplies…")
-        b1, b2, b3 = st.columns([1, 1, 1])
-        trip_from = b1.text_input("From")
-        trip_to = b2.text_input("To")
-        trip_notes = b3.text_input("Notes")
-        if st.form_submit_button("Add trip", type="primary"):
-            try:
+    tab_paste, tab_repeat, tab_one = st.tabs(["Paste from a sheet", "Repeat weekly", "Single trip"])
+    with tab_paste:
+        st.caption("Copy rows from Excel or Sheets (Trip Date, Purpose, Miles) and paste them here. Dates like 04/08/26 work.")
+        pasted = st.text_area("Pasted trips", height=150, key=f"mile_paste_{st.session_state.get('mile_paste_n', 0)}",
+                              label_visibility="collapsed", placeholder="Trip Date\tPurpose\tMiles\n04/08/26\tWeekly round trip\t18")
+        paste_kind = st.selectbox("Type", list(mileage_mod.KINDS), key="mile_paste_kind")
+        pasted_trips, pasted_problems = mileage_mod.parse_pasted(pasted)
+        for problem in pasted_problems:
+            st.warning(problem)
+        if pasted_trips:
+            st.caption(f"{len(pasted_trips)} trips · {sum(t['miles'] for t in pasted_trips):,.1f} miles")
+            st.dataframe(pd.DataFrame(pasted_trips).rename(columns={"trip_date": "Date", "purpose": "Purpose", "miles": "Miles"}),
+                         hide_index=True, width="stretch", height=min(260, 40 + 35 * len(pasted_trips)))
+            if st.button(f"Add {len(pasted_trips)} trips", type="primary", key="mile_paste_add"):
                 with db.connect(DB_PATH) as connection:
-                    mileage_mod.add_trip(connection, business_id, trip_date=trip_day.isoformat(), miles=float(trip_miles),
-                                         kind=trip_kind, purpose=trip_purpose, start_place=trip_from, end_place=trip_to,
-                                         notes=trip_notes)
+                    added, skipped = mileage_mod.add_trips(connection, business_id, pasted_trips, paste_kind)
+                st.session_state["mile_paste_n"] = st.session_state.get("mile_paste_n", 0) + 1
+                st.session_state["mile_message"] = f"Added {added} trip(s)" + (f"; skipped {skipped} already logged." if skipped else ".")
                 rerun()
-            except ValueError as error:
-                st.error(str(error))
+    with tab_repeat:
+        months = [f"{mile_year}-{m:02d}" for m in range(1, 13)]
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        first_month = rc1.selectbox("From month", months, index=3, key="mile_rep_from")
+        last_month = rc2.selectbox("To month", months, index=9, key="mile_rep_to")
+        weekday_name = rc3.selectbox("Day", ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+                                     index=2, key="mile_rep_day")
+        every = rc4.selectbox("Every", ["week", "2 weeks", "4 weeks"], key="mile_rep_every")
+        rc5, rc6, rc7 = st.columns([1, 2, 1])
+        rep_miles = rc5.number_input("Miles per trip", 0.0, 5000.0, 18.0, 0.5, key="mile_rep_miles")
+        rep_purpose = rc6.text_input("Purpose", "Weekly round trip", key="mile_rep_purpose")
+        rep_kind = rc7.selectbox("Type", list(mileage_mod.KINDS), key="mile_rep_kind")
+        try:
+            rep_dates = mileage_mod.repeat_dates(first_month, last_month,
+                                                 ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].index(weekday_name),
+                                                 {"week": 1, "2 weeks": 2, "4 weeks": 4}[every])
+        except ValueError as error:
+            rep_dates = []
+            st.error(str(error))
+        if rep_dates and rep_miles > 0:
+            st.caption(f"{len(rep_dates)} trips · {len(rep_dates) * rep_miles:,.1f} miles · {rep_dates[0]} → {rep_dates[-1]}")
+            if st.button(f"Add {len(rep_dates)} trips", type="primary", key="mile_rep_add"):
+                with db.connect(DB_PATH) as connection:
+                    added, skipped = mileage_mod.add_trips(
+                        connection, business_id, [{"trip_date": d, "purpose": rep_purpose, "miles": rep_miles} for d in rep_dates], rep_kind)
+                st.session_state["mile_message"] = f"Added {added} trip(s)" + (f"; skipped {skipped} already logged." if skipped else ".")
+                rerun()
+    with tab_one:
+        with st.form("mile_add", clear_on_submit=True, border=True):
+            a1, a2, a3, a4 = st.columns([1.2, 1, 1, 1])
+            trip_day = a1.date_input("Date", value=date.today())
+            trip_miles = a2.number_input("Miles", 0.0, 5000.0, 0.0, 0.1)
+            trip_kind = a3.selectbox("Type", list(mileage_mod.KINDS))
+            trip_purpose = a4.text_input("Purpose", placeholder="Client visit, bank, supplies…")
+            b1, b2, b3 = st.columns([1, 1, 1])
+            trip_from = b1.text_input("From")
+            trip_to = b2.text_input("To")
+            trip_notes = b3.text_input("Notes")
+            if st.form_submit_button("Add trip", type="primary"):
+                try:
+                    with db.connect(DB_PATH) as connection:
+                        mileage_mod.add_trip(connection, business_id, trip_date=trip_day.isoformat(), miles=float(trip_miles),
+                                             kind=trip_kind, purpose=trip_purpose, start_place=trip_from, end_place=trip_to,
+                                             notes=trip_notes)
+                    rerun()
+                except ValueError as error:
+                    st.error(str(error))
+    if st.session_state.get("mile_message"):
+        st.success(st.session_state.pop("mile_message"))
     summary_lines = mileage_mod.summarize(trips, rates)
     st.dataframe(pd.DataFrame(summary_lines), hide_index=True, width="stretch",
                  column_config={"Rate per mile": st.column_config.NumberColumn(format="$%.3f"),

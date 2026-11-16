@@ -908,6 +908,14 @@ class BooksTests(unittest.TestCase):
             lines = mileage.summarize(trips, mileage.get_rates(connection, 2026))
             self.assertEqual(lines[0]["Deduction"], 8.0)
             self.assertTrue(summary.summary_workbook(connection, self.business, "Test", "2026-01-01", "2026-12-31", 2026)[:2] == b"PK")
+            parsed, bad = mileage.parse_pasted("Trip Date\tPurpose\tMiles\n04/08/26\tWeekly round trip\t18\n04/15/26\tWeekly round trip\t18\nTotal miles\t\t36\nxx\tbad\t1")
+            self.assertEqual([(t["trip_date"], t["purpose"], t["miles"]) for t in parsed],
+                             [("2026-04-08", "Weekly round trip", 18.0), ("2026-04-15", "Weekly round trip", 18.0)])
+            self.assertEqual(len(bad), 1)
+            dates = mileage.repeat_dates("2026-04", "2026-10", 2)
+            self.assertEqual((dates[0], dates[-1], len(dates)), ("2026-04-01", "2026-10-28", 31))
+            self.assertEqual(mileage.add_trips(connection, self.business, parsed), (2, 0))
+            self.assertEqual(mileage.add_trips(connection, self.business, parsed), (0, 2))
             self.assertEqual(mileage.delete_trips(connection, self.business, [trips[0]["id"]]), 1)
 
     def test_ask_search(self):
@@ -940,7 +948,14 @@ class BooksTests(unittest.TestCase):
                     transaction_date=day, posting_date=None, description=text, source_amount=amount, signed_amount=amount)
                 db.classify_transaction(connection, tid, category_id=None, treatment=treatment)
             self.assertEqual([r["Amount"] for r in ask.run(connection, ask.parse("loan draws 2026", [], [], today), self.business)], [8000])
+            q = ask.parse("loan draw", ["Loan"], [], today)
+            self.assertEqual((q.treatments, q.category), (["Loan draw"], ""))
             self.assertEqual([r["Amount"] for r in ask.run(connection, ask.parse("internal transfers", [], [], today), self.business)], [-500])
+            self.assertEqual(db.owner_equity(connection, [self.business]), {"contributions": 0.0, "draws": 0.0})
+            tid, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                transaction_date="2026-06-01", posting_date=None, description="OWNER IN", source_amount=700, signed_amount=700)
+            db.classify_transaction(connection, tid, category_id=None, treatment="Owner contribution")
+            self.assertEqual(db.owner_equity(connection, [self.business], "2026-01-01", "2026-12-31")["contributions"], 700)
             self.assertEqual(ask.run(connection, ask.parse("nothing like this", [], [], today), self.business), [])
 
     def test_staff_payments_and_company_revenue(self):

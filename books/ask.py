@@ -157,17 +157,17 @@ def parse(question: str, categories: list[str] | None = None, business_names: li
             query.terms.append(name.lower())
             text = text.replace(name.lower(), " ")
 
+    # treatments named outright (loan draw, internal transfer, owner draw ...)
+    for pattern, names in TREATMENT_PHRASES:
+        if take(rf"\b{pattern}\b"):
+            query.treatments += [name for name in names if name not in query.treatments]
+
     # categories mentioned
     for name in sorted(categories or [], key=len, reverse=True):
         if len(name) >= 4 and name.lower() in text:
             query.category = name
             text = text.replace(name.lower(), " ")
             break
-
-    # treatments named outright (loan draw, internal transfer, owner draw ...)
-    for pattern, names in TREATMENT_PHRASES:
-        if take(rf"\b{pattern}\b"):
-            query.treatments += [name for name in names if name not in query.treatments]
 
     # kind words
     for word in re.findall(r"[a-z]+", text):

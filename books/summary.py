@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 from typing import Any
 
@@ -160,6 +160,21 @@ def summary_workbook(connection: sqlite3.Connection, business_id: int, business_
             miles.cell(row=log_row + 1 + index, column=column, value=value)
     for column, width in zip("ABCDEFG", (14, 12, 10, 26, 26, 34, 30)):
         miles.column_dimensions[column].width = width
+    log = book.create_sheet("Business miles")
+    for column, label in enumerate(("Trip Date", "Purpose", "Miles"), start=1):
+        cell = log.cell(row=1, column=column, value=label)
+        cell.font, cell.fill = Font(bold=True, color="FFFFFF"), HEAD_FILL
+        cell.alignment = Alignment(horizontal="center")
+    business_trips = sorted((trip for trip in trips if trip["kind"] == "Business"), key=lambda item: item["trip_date"])
+    for index, trip in enumerate(business_trips, start=2):
+        log.cell(row=index, column=1, value=datetime.strptime(trip["trip_date"], "%Y-%m-%d")).number_format = "mm/dd/yy"
+        log.cell(row=index, column=2, value=trip["purpose"])
+        log.cell(row=index, column=3, value=trip["miles"])
+    total_at = len(business_trips) + 3
+    log.cell(row=total_at, column=1, value="Total miles").font = Font(bold=True)
+    log.cell(row=total_at, column=3, value=f"=SUM(C2:C{max(2, total_at - 2)})").font = Font(bold=True)
+    for column, width in zip("ABC", (14, 34, 10)):
+        log.column_dimensions[column].width = width
     output = BytesIO()
     book.save(output)
     return output.getvalue()

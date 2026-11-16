@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime
+import re
+from datetime import date, datetime, timedelta
 from typing import Any
 
 SCHEMA = """
@@ -84,3 +85,70 @@ def summarize(trips: list[dict[str, Any]], rates: dict[str, float]) -> list[dict
         rows.append({"Type": kind, "Trips": count, "Miles": miles, "Rate per mile": rates[kind],
                      "Deduction": round(miles * rates[kind], 2)})
     return rows
+
+
+def _parse_date(text: str) -> str:
+    text = text.strip()
+    for pattern in ("%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m-%d-%y"):
+        try:
+            return datetime.strptime(text, pattern).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(f"Cannot read the date '{text}'.")
+
+
+def parse_pasted(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Rows copied from a spreadsheet: date, purpose, miles (tab, comma or several spaces between)."""
+    trips, problems = [], []
+    for number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered.startswith(("trip date", "date", "total")):
+            continue
+        parts = [part.strip() for part in re.split(r"\t+|\s{2,}|,(?=\s*[A-Za-z0-9$])", line) if part.strip()]
+        if len(parts) < 2:
+            parts = line.split(None, 1) if len(line.split()) < 3 else [line.split()[0], " ".join(line.split()[1:-1]), line.split()[-1]]
+        try:
+            trip_date = _parse_date(parts[0])
+            miles = float(parts[-1].replace(",", ""))
+            purpose = " ".join(parts[1:-1]) if len(parts) > 2 else ""
+            if miles <= 0:
+                raise ValueError("Miles must be more than zero.")
+            trips.append({"trip_date": trip_date, "purpose": purpose, "miles": miles})
+        except (ValueError, IndexError) as error:
+            problems.append(f"Line {number}: {error}")
+    return trips, problems
+
+
+def repeat_dates(first_month: str, last_month: str, weekday: int, every_weeks: int = 1) -> list[str]:
+    """Every `every_weeks` weeks on `weekday` (Monday=0) from the first day of first_month to the end of last_month."""
+    start = date(int(first_month[:4]), int(first_month[5:7]), 1)
+    end_year, end_month = int(last_month[:4]), int(last_month[5:7])
+    end = date(end_year + (end_month == 12), end_month % 12 + 1, 1) - timedelta(days=1)
+    if end < start:
+        raise ValueError("The last month is before the first month.")
+    current = start + timedelta(days=(weekday - start.weekday()) % 7)
+    dates = []
+    while current <= end:
+        dates.append(current.isoformat())
+        current += timedelta(weeks=max(1, every_weeks))
+    return dates
+
+
+def add_trips(connection: sqlite3.Connection, business_id: int, trips: list[dict[str, Any]], kind: str = "Business",
+              start_place: str = "", end_place: str = "") -> tuple[int, int]:
+    """Add many trips; a trip already logged with the same date, purpose and miles is skipped. Returns (added, skipped)."""
+    added = skipped = 0
+    for trip in trips:
+        exists = connection.execute(
+            "SELECT 1 FROM mileage_log WHERE business_id = ? AND trip_date = ? AND purpose = ? AND miles = ? AND kind = ?",
+            (business_id, trip["trip_date"], trip.get("purpose", "").strip(), round(trip["miles"], 1), kind)).fetchone()
+        if exists:
+            skipped += 1
+            continue
+        add_trip(connection, business_id, trip_date=trip["trip_date"], miles=trip["miles"], kind=kind,
+                 purpose=trip.get("purpose", ""), start_place=start_place, end_place=end_place)
+        added += 1
+    return added, skipped

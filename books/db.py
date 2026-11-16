@@ -1854,6 +1854,22 @@ def loan_report(
     return sorted(report, key=lambda r: -(abs(r["owed_to_us"]) + abs(r["we_owe"])))
 
 
+def owner_equity(connection: sqlite3.Connection, business_ids: list[int], start: str | None = None,
+                 end: str | None = None) -> dict[str, float]:
+    """Money the owner put in or took out as equity (not debt): contributions and owner draws."""
+    if not business_ids:
+        return {"contributions": 0.0, "draws": 0.0}
+    clause, extra = _date_clause("transaction_date", start, end)
+    marks = ",".join("?" * len(business_ids))
+    totals = {"Owner contribution": 0.0, "Owner draw": 0.0}
+    for row in connection.execute(
+        f"""SELECT treatment, SUM(ABS(signed_amount)) AS total FROM transactions
+            WHERE business_id IN ({marks}) AND status != 'split' AND treatment IN ('Owner contribution', 'Owner draw'){clause}
+            GROUP BY treatment""", [*business_ids, *extra]):
+        totals[row["treatment"]] = float(row["total"] or 0)
+    return {"contributions": round(totals["Owner contribution"], 2), "draws": round(totals["Owner draw"], 2)}
+
+
 def loan_direction_problems(connection: sqlite3.Connection, business_id: int) -> list[dict[str, Any]]:
     """Loan and owner-money entries that need fixing: wrong way for the money, or filed under an owner party."""
     treatments = LOAN_TREATMENTS + ("Owner contribution", "Owner draw")

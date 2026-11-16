@@ -419,6 +419,8 @@ def init_db(db_path: str | Path) -> None:
         split_categories_by_business(connection)
         from . import staff as _staff  # local import: staff builds on this module
         _staff.ensure_schema(connection)
+        from . import mileage as _mileage
+        _mileage.ensure_schema(connection)
 
 
 def slugify(name: str) -> str:

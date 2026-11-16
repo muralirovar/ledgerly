@@ -11,7 +11,7 @@ import hmac
 import pandas as pd
 import streamlit as st
 
-from books import ai_config, ask as ask_mod, backup, db, documents, exporter, importers, statements
+from books import ai_config, ask as ask_mod, backup, mileage as mileage_mod, summary as summary_mod, db, documents, exporter, importers, statements
 from books import staff as staff_mod
 
 
@@ -602,11 +602,11 @@ if businesses:
     business_id = int(business_by_name[business_name]["id"])
 nav = {
     "▦  Dashboard": "Dashboard", "↗  Revenue & expense": "Revenue & Expense",
-    "▣  Tax prep": "Tax Prep", "♙  Personal tax prep": "Personal Tax Prep",
+    "▣  Tax prep": "Tax Prep", "⛟  Tax & business miles": "Mileage", "♙  Personal tax prep": "Personal Tax Prep",
     "⇧  Import transactions": "Import / Paste",
     "▤  Statements & checks": "Statements & Checks",
     "＄  Deposits": "Deposits", "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
-    "▥  Reports": "Reports", "⌕  Ask your books": "Ask Your Books", "☻  Staff & payroll": "Staff & Payroll", "☷  Parties": "Parties", "⌁  Categories & rules": "Categories & Rules",
+    "▥  Reports": "Reports", "▤  Summary sheet": "Summary Sheet", "⌕  Ask your books": "Ask Your Books", "☻  Staff & payroll": "Staff & Payroll", "☷  Parties": "Parties", "⌁  Categories & rules": "Categories & Rules",
     "◇  Accounts & credit": "Accounts & Credit",
     "⚙  Manage business": "Manage Business", "↓  Export & settings": "Export & Settings",
     "🛡  Admin & backup": "Admin & Backup",
@@ -614,11 +614,11 @@ nav = {
 if st.session_state.get("nav_choice") not in nav:
     st.session_state["nav_choice"] = "▦  Dashboard"
 NAV_GROUPS = {
-    "Overview": ["▦  Dashboard", "↗  Revenue & expense", "▥  Reports"],
+    "Overview": ["▦  Dashboard", "↗  Revenue & expense", "▤  Summary sheet", "▥  Reports"],
     "Bookkeeping": ["⇧  Import transactions", "▤  Statements & checks", "＄  Deposits", "✓  Review queue",
                     "≡  All transactions"],
     "People & payroll": ["☻  Staff & payroll", "☷  Parties", "⌁  Categories & rules"],
-    "Tax": ["▣  Tax prep", "♙  Personal tax prep"],
+    "Tax": ["▣  Tax prep", "♙  Personal tax prep", "⛟  Tax & business miles"],
     "Setup": ["◇  Accounts & credit", "⚙  Manage business", "↓  Export & settings", "🛡  Admin & backup"],
 }
 nav_choice = st.session_state["nav_choice"]
@@ -3353,6 +3353,101 @@ elif page == "Ask Your Books":
                                file_name="ask-results.csv", mime="text/csv")
             if len(found) >= 2000:
                 st.caption("Showing the newest 2,000 matches. Narrow the question to see the rest.")
+
+elif page == "Summary Sheet":
+    page_header("Preliminary revenue and expense summary",
+                "Revenue, expenses, items excluded and cash-flow controls for a date range, with an Excel copy.",
+                "Summary sheet")
+    sd1, sd2, sd3 = st.columns([1, 1, 3])
+    summary_start = sd1.date_input("From", value=date(date.today().year, 1, 1), key="sum_from")
+    summary_end = sd2.date_input("To", value=date.today(), key="sum_to")
+    with db.connect(DB_PATH) as connection:
+        data = summary_mod.preliminary(connection, business_id, summary_start.isoformat(), summary_end.isoformat())
+        sum_book = summary_mod.summary_workbook(connection, business_id, business_name, summary_start.isoformat(),
+                                                summary_end.isoformat(), summary_start.year)
+    sd3.download_button("⤓ Excel (summary + miles sheet)", sum_book, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        file_name=f"{db.slugify(business_name)}-summary-{summary_start.year}.xlsx")
+    st.caption(f"{business_name} · {summary_start:%b %d, %Y} – {summary_end:%b %d, %Y} · USD")
+
+    def money_frame(items: list[dict], total_label: str = "", total_count: int = 0, total: float = 0.0, first: str = "") -> pd.DataFrame:
+        lines = [{first: item["label"], "Count": item["count"], "Amount": money(item["amount"])} for item in items]
+        if total_label:
+            lines.append({first: total_label, "Count": total_count, "Amount": money(total)})
+        return pd.DataFrame(lines)
+
+    left, right = st.columns(2)
+    with left:
+        st.dataframe(pd.DataFrame([{"Preliminary summary": "Net revenue", "Amount": money(data["revenue_total"])},
+                                   {"Preliminary summary": "Expenses", "Amount": money(data["expense_total"])},
+                                   {"Preliminary summary": "Net before review items", "Amount": money(data["net"])}]),
+                     hide_index=True, width="stretch")
+        st.dataframe(money_frame(data["revenue"], "Total net revenue", data["revenue_count"], data["revenue_total"],
+                                 "Revenue detail"), hide_index=True, width="stretch")
+    with right:
+        st.dataframe(money_frame(data["excluded"], first="Items excluded or requiring treatment"),
+                     hide_index=True, width="stretch")
+        st.dataframe(money_frame(data["expenses"], "Total expenses", data["expense_count"], data["expense_total"],
+                                 "Expense detail"), hide_index=True, width="stretch")
+    st.dataframe(money_frame(data["controls"], first="Cash-flow controls"), hide_index=True, width="stretch")
+    st.markdown("**Method**")
+    for note in data["method"]:
+        st.caption(note)
+
+elif page == "Mileage":
+    page_header("Tax and business miles", "Log trips, set the per-mile rates and see the mileage deduction by year.",
+                "Tax & business miles")
+    mile_year = st.number_input("Tax year", 2018, date.today().year + 1, date.today().year, step=1, key="mile_year")
+    with db.connect(DB_PATH) as connection:
+        rates = mileage_mod.get_rates(connection, int(mile_year))
+        trips = mileage_mod.list_trips(connection, business_id, int(mile_year))
+    with st.expander("Rates per mile (defaults are the 2025 IRS standard rates — update for other years)"):
+        rate_cols = st.columns(3)
+        new_rates = {kind: col.number_input(f"{kind} $/mile", 0.0, 5.0, float(rates[kind]), 0.005, format="%.3f",
+                                            key=f"mile_rate_{mile_year}_{kind}")
+                     for kind, col in zip(("Business", "Medical", "Charity"), rate_cols)}
+        if st.button("Save rates", key="mile_save_rates"):
+            with db.connect(DB_PATH) as connection:
+                for kind, value in new_rates.items():
+                    mileage_mod.set_rate(connection, int(mile_year), kind, value)
+            rerun()
+    with st.form("mile_add", clear_on_submit=True, border=True):
+        a1, a2, a3, a4 = st.columns([1.2, 1, 1, 1])
+        trip_day = a1.date_input("Date", value=date.today())
+        trip_miles = a2.number_input("Miles", 0.0, 5000.0, 0.0, 0.1)
+        trip_kind = a3.selectbox("Type", list(mileage_mod.KINDS))
+        trip_purpose = a4.text_input("Purpose", placeholder="Client visit, bank, supplies…")
+        b1, b2, b3 = st.columns([1, 1, 1])
+        trip_from = b1.text_input("From")
+        trip_to = b2.text_input("To")
+        trip_notes = b3.text_input("Notes")
+        if st.form_submit_button("Add trip", type="primary"):
+            try:
+                with db.connect(DB_PATH) as connection:
+                    mileage_mod.add_trip(connection, business_id, trip_date=trip_day.isoformat(), miles=float(trip_miles),
+                                         kind=trip_kind, purpose=trip_purpose, start_place=trip_from, end_place=trip_to,
+                                         notes=trip_notes)
+                rerun()
+            except ValueError as error:
+                st.error(str(error))
+    summary_lines = mileage_mod.summarize(trips, rates)
+    st.dataframe(pd.DataFrame(summary_lines), hide_index=True, width="stretch",
+                 column_config={"Rate per mile": st.column_config.NumberColumn(format="$%.3f"),
+                                "Deduction": st.column_config.NumberColumn(format="$%.2f")})
+    st.metric("Total mileage deduction", money(sum(item["Deduction"] for item in summary_lines)))
+    if trips:
+        trip_frame = pd.DataFrame(trips)[["id", "trip_date", "kind", "miles", "start_place", "end_place", "purpose", "notes"]]
+        trip_frame.insert(0, "Delete", False)
+        edited = st.data_editor(trip_frame, hide_index=True, width="stretch", key=f"mile_table_{mile_year}",
+                                disabled=[c for c in trip_frame.columns if c != "Delete"],
+                                column_config={"id": None, "trip_date": "Date", "kind": "Type", "miles": "Miles",
+                                               "start_place": "From", "end_place": "To", "purpose": "Purpose", "notes": "Notes"})
+        marked = [int(row["id"]) for _, row in edited.iterrows() if row["Delete"]]
+        if marked and st.button(f"Delete {len(marked)} selected trip(s)", key="mile_delete"):
+            with db.connect(DB_PATH) as connection:
+                mileage_mod.delete_trips(connection, business_id, marked)
+            rerun()
+    else:
+        st.info("No trips logged for this year yet.")
 
 elif page == "Parties":
     page_header("Everyone you do business with",

@@ -885,6 +885,31 @@ class BooksTests(unittest.TestCase):
                              [{"kind": "transaction", "id": txn[0], "notes": "x"}]), 0)
 
 
+    def test_summary_and_mileage(self):
+        from books import mileage, summary
+        with db.connect(self.path) as connection:
+            for day, text, amount, treatment in (("2026-02-01", "CLIENT PAY", 1000, "Revenue"), ("2026-02-02", "REFUND", -100, "Revenue refund"),
+                                                 ("2026-02-03", "HOST", -40, "Expense"), ("2026-02-04", "TO SAV", -500, "Transfer")):
+                tid, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                    transaction_date=day, posting_date=None, description=text, source_amount=amount, signed_amount=amount)
+                db.classify_transaction(connection, tid, category_id=self.category if treatment == "Expense" else None,
+                                        treatment=treatment)
+            data = summary.preliminary(connection, self.business, "2026-01-01", "2026-12-31")
+            self.assertEqual((data["revenue_total"], data["expense_total"], data["net"]), (900, 40, 860))
+            self.assertEqual(data["excluded"][0]["amount"], 500)
+            mileage.add_trip(connection, self.business, trip_date="2026-03-01", miles=10, purpose="Bank")
+            mileage.add_trip(connection, self.business, trip_date="2026-03-02", miles=5.5, kind="Charity")
+            with self.assertRaises(ValueError):
+                mileage.add_trip(connection, self.business, trip_date="2026-03-02", miles=0)
+            rates = mileage.get_rates(connection, 2026)
+            self.assertEqual(rates["Business"], 0.70)
+            mileage.set_rate(connection, 2026, "Business", 0.8)
+            trips = mileage.list_trips(connection, self.business, 2026)
+            lines = mileage.summarize(trips, mileage.get_rates(connection, 2026))
+            self.assertEqual(lines[0]["Deduction"], 8.0)
+            self.assertTrue(summary.summary_workbook(connection, self.business, "Test", "2026-01-01", "2026-12-31", 2026)[:2] == b"PK")
+            self.assertEqual(mileage.delete_trips(connection, self.business, [trips[0]["id"]]), 1)
+
     def test_ask_search(self):
         from datetime import date
         from books import ask

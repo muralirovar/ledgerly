@@ -885,6 +885,39 @@ class BooksTests(unittest.TestCase):
                              [{"kind": "transaction", "id": txn[0], "notes": "x"}]), 0)
 
 
+    def test_ask_search(self):
+        from datetime import date
+        from books import ask
+        with db.connect(self.path) as connection:
+            for day, text, amount in (("2026-03-05", "ZELLE TO ALGEBRA IT LLC", -6000), ("2026-03-20", "HOSTING CO", -50),
+                                      ("2026-04-02", "ZELLE TO ALGEBRA IT LLC", -4000), ("2026-04-09", "ACME DEPOSIT", 9000)):
+                tid, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                    transaction_date=day, posting_date=None, description=text, source_amount=amount, signed_amount=amount)
+                if amount < 0:
+                    db.classify_transaction(connection, tid, category_id=self.category, treatment="Expense")
+            today = date(2026, 5, 15)
+            q = ask.parse("algebra it payments over 5000 2026", ["Hosting"], [], today)
+            rows = ask.run(connection, q, self.business)
+            self.assertEqual([r["Amount"] for r in rows], [-6000])
+            q = ask.parse("algebraIT by month", [], [], today)
+            self.assertEqual({g["Month"]: g["Out"] for g in ask.group(ask.run(connection, q, self.business), "Month")},
+                             {"2026-03": 6000, "2026-04": 4000})
+            q = ask.parse("april", [], [], today)
+            self.assertEqual((q.start, q.end), ("2026-04-01", "2026-04-30"))
+            self.assertEqual(len(ask.run(connection, q, self.business)), 2)
+            q = ask.parse("hosting last month", ["Hosting"], [], today)
+            self.assertEqual((q.category, q.start), ("Hosting", "2026-04-01"))
+            q = ask.parse("$9,000", [], [], today)
+            self.assertEqual(ask.totals(ask.run(connection, q, self.business))["in"], 9000)
+            for day, text, amount, treatment in (("2026-05-01", "LOC ADVANCE", 8000, "Loan draw"),
+                                                 ("2026-05-02", "TO SAVINGS", -500, "Transfer")):
+                tid, _, _ = db.insert_transaction(connection, business_id=self.business, account_id=self.account,
+                    transaction_date=day, posting_date=None, description=text, source_amount=amount, signed_amount=amount)
+                db.classify_transaction(connection, tid, category_id=None, treatment=treatment)
+            self.assertEqual([r["Amount"] for r in ask.run(connection, ask.parse("loan draws 2026", [], [], today), self.business)], [8000])
+            self.assertEqual([r["Amount"] for r in ask.run(connection, ask.parse("internal transfers", [], [], today), self.business)], [-500])
+            self.assertEqual(ask.run(connection, ask.parse("nothing like this", [], [], today), self.business), [])
+
     def test_staff_payments_and_company_revenue(self):
         from books import staff
         with db.connect(self.path) as connection:

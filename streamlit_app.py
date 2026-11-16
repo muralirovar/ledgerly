@@ -11,7 +11,7 @@ import hmac
 import pandas as pd
 import streamlit as st
 
-from books import ai_config, backup, db, documents, exporter, importers, statements
+from books import ai_config, ask as ask_mod, backup, db, documents, exporter, importers, statements
 from books import staff as staff_mod
 
 
@@ -82,7 +82,7 @@ st.markdown("""
   button[data-testid="stExpandSidebarButton"] span {color:#fff !important;}
   body:has([data-testid="stSidebarCollapseButton"] button[aria-expanded="true"])
     button[data-testid="stExpandSidebarButton"] {display:none !important;}
-  [data-testid="stMainBlockContainer"] {max-width: 2000px; padding: 2.25rem 2rem 4rem;}
+  [data-testid="stMainBlockContainer"] {max-width: 2000px; padding: 3rem 2rem 4rem;}
   [data-testid="stSidebar"] {background: linear-gradient(180deg, #0d3a5c 0%, #0b3150 62%, #12141d 100%); border-right: 0;}
   [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap: .72rem;}
   [data-testid="stSidebar"] label, [data-testid="stSidebar"] p, [data-testid="stSidebar"] span {color: #dce7ef;}
@@ -114,7 +114,19 @@ st.markdown("""
   .brand-mark {width:40px; height:40px; border-radius:12px; display:grid; place-items:center; color:#0d3a5c; background:#f0b73f; font-size:1.35rem; font-weight:900; box-shadow:0 8px 24px rgba(0,0,0,.22);}
   .brand-name {color:#fff; font-size:1.1rem; font-weight:760; letter-spacing:-.02em;}
   .brand-sub {color:#9fc3dc; font-size:.72rem; text-transform:uppercase; letter-spacing:.12em; margin-top:.1rem;}
-  .page-head {margin:.15rem 0 1.6rem;}
+  [data-testid="stSidebarUserContent"] {padding-top:.4rem !important;}
+  .st-key-brand_home {margin-top:-3.6rem; width:calc(100% - 3.2rem) !important;}
+  .st-key-brand_home button {padding:.2rem 0; min-height:0;}
+  .st-key-brand_home button p {font-size:.68rem !important; letter-spacing:.08em; text-transform:uppercase; font-weight:700; color:#fff !important; white-space:nowrap;}
+  .page-head {margin:0 0 .5rem;}
+  .page-head .page-title {font-size:1.5rem !important;}
+  .st-key-ask_fab {position:fixed; bottom:1.4rem; right:1.6rem; z-index:1000000; width:auto !important;}
+  .st-key-ask_fab button, .st-key-ask_fab button:hover, .st-key-ask_fab button:focus {width:3.6rem; height:3.6rem; padding:0; border-radius:50%; border:0 !important; opacity:1 !important;
+    background:linear-gradient(135deg,#1778ba,#0d3a5c) !important; box-shadow:0 6px 18px rgba(13,58,92,.45);}
+  .st-key-ask_fab button p {font-size:1.6rem !important; line-height:1;}
+  .st-key-ask_fab button svg {display:none;}
+  .st-key-ask_fab button:hover {transform:scale(1.06);}
+  [data-testid="stPopoverBody"] {width:min(620px, 92vw) !important; max-height:75vh;}
   .eyebrow {font-size:.73rem; font-weight:750; color:var(--teal); text-transform:uppercase; letter-spacing:.14em; margin-bottom:.45rem;}
   .page-title {font-family: "Barlow Condensed", Barlow, sans-serif; font-weight:700; font-size:2.35rem; line-height:1.08; color:var(--ink); letter-spacing:-.035em; margin:0;}
   .page-sub {color:var(--muted); font-size:.98rem; margin-top:.55rem; max-width:760px; line-height:1.55;}
@@ -163,9 +175,7 @@ def rerun() -> None:
 
 def page_header(title: str, subtitle: str, eyebrow: str = "Workspace") -> None:
     st.markdown(
-        f'<div class="page-head"><div class="eyebrow">{escape(eyebrow)}</div>'
-        f'<h1 class="page-title">{escape(title)}</h1>'
-        f'<div class="page-sub">{escape(subtitle)}</div></div>',
+        f'<div class="page-head"><h1 class="page-title" title="{escape(subtitle)}">{escape(eyebrow)}</h1></div>',
         unsafe_allow_html=True,
     )
 
@@ -353,6 +363,13 @@ def rerun_dialog() -> None:
         st.rerun(scope="fragment")
     except st.errors.StreamlitAPIException:
         st.rerun()
+
+
+def go_to_ask_full() -> None:
+    chat = st.session_state.get("ask_chat") or []
+    if chat:
+        st.session_state["ask_text"] = chat[-1]["q"]
+    st.session_state["nav_choice"] = "⌕  Ask your books"
 
 
 def go_to(label: str) -> None:
@@ -571,8 +588,8 @@ def render_personal_tax_prep() -> None:
 with db.connect(DB_PATH) as connection:
     businesses = db.list_businesses(connection)
 
-st.sidebar.markdown('<div class="brand-sub" style="margin:.2rem 0 .6rem .2rem">Ledgerly · Business books</div>',
-                    unsafe_allow_html=True)
+st.sidebar.button("Ledgerly · Business books", key="brand_home", help="Go to the dashboard",
+                  on_click=go_to, args=("▦  Dashboard",), type="tertiary")
 business_by_name = {item["name"]: item for item in businesses}
 business_names = list(business_by_name)
 if businesses:
@@ -589,7 +606,7 @@ nav = {
     "⇧  Import transactions": "Import / Paste",
     "▤  Statements & checks": "Statements & Checks",
     "＄  Deposits": "Deposits", "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
-    "▥  Reports": "Reports", "☻  Staff & payroll": "Staff & Payroll", "☷  Parties": "Parties", "⌁  Categories & rules": "Categories & Rules",
+    "▥  Reports": "Reports", "⌕  Ask your books": "Ask Your Books", "☻  Staff & payroll": "Staff & Payroll", "☷  Parties": "Parties", "⌁  Categories & rules": "Categories & Rules",
     "◇  Accounts & credit": "Accounts & Credit",
     "⚙  Manage business": "Manage Business", "↓  Export & settings": "Export & Settings",
     "🛡  Admin & backup": "Admin & Backup",
@@ -617,6 +634,44 @@ for group_name, group_items in NAV_GROUPS.items():
                  format_func=lambda label: label.split("  ", 1)[-1],
                  on_change=pick_nav, args=(group_name,), label_visibility="collapsed")
 page = nav[nav_choice]
+if True:
+    with st.popover("💬", key="ask_fab", help="Ask your books", width="content"):
+        st.markdown("**Ask your books**  \n<span style='font-size:.8rem;color:#6b7785'>Try: makesh payments 2026 · checks over 5000 · revenue sept by month</span>",
+                    unsafe_allow_html=True)
+        chat = st.session_state.setdefault("ask_chat", [])
+        st.caption("Includes loan draws, repayments, owner draws, internal transfers and every category. Add “all businesses” to search every company.")
+        with st.form("ask_chat_form", clear_on_submit=True, border=False):
+            typed = st.text_input("Question", label_visibility="collapsed", placeholder="Ask about your transactions…")
+            asked = st.form_submit_button("Ask", type="primary")
+        if asked and typed.strip():
+            with db.connect(DB_PATH) as connection:
+                parsed_q = ask_mod.parse(typed, [c["name"] for c in db.list_categories(connection, business_id)], [])
+                found_q = ask_mod.run(connection, parsed_q, business_id)
+            chat.append({"q": typed.strip(), "found": found_q, "parsed": parsed_q})
+            del chat[:-6]
+        for entry in reversed(chat):
+            with st.chat_message("user"):
+                st.write(entry["q"])
+            with st.chat_message("assistant"):
+                tot = ask_mod.totals(entry["found"])
+                st.caption(" · ".join(ask_mod.describe(entry["parsed"])) or "Everything")
+                if not entry["found"]:
+                    st.write("Nothing matched. Try fewer words or add “all businesses”.")
+                else:
+                    st.write(f"**{tot['count']:,}** matches · in **{money(tot['in'])}** · out **{money(tot['out'])}** · net **{money(tot['net'])}**".replace("$", "\\$"))
+                    if entry["parsed"].group_by:
+                        st.dataframe(pd.DataFrame(ask_mod.group(entry["found"], entry["parsed"].group_by)),
+                                     hide_index=True, width="stretch", height=min(300, 40 + 35 * len(entry["found"])))
+                    else:
+                        st.dataframe(pd.DataFrame(entry["found"])[["Date", "Description", "Amount", "Category", "Treatment"]].head(15),
+                                     hide_index=True, width="stretch", height=300,
+                                     column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+                        if tot["count"] > 15:
+                            st.caption(f"Showing 15 of {tot['count']:,}.")
+        if chat:
+            full_col, clear_col = st.columns(2)
+            full_col.button("Full results", key="ask_full", width="stretch", on_click=go_to_ask_full)
+            clear_col.button("Clear", key="ask_clear", width="stretch", on_click=lambda: st.session_state.update(ask_chat=[]))
 
 def render_admin() -> None:
     page_header("Protect your books",
@@ -2199,7 +2254,9 @@ elif page == "Transactions":
         accounts = db.list_accounts(connection, business_id)
         categories = db.list_categories(connection, business_id)
         rows = db.list_transactions(connection, business_id, limit=100000)
-    search = st.text_input("Search all transaction fields", placeholder="Merchant, amount, note, reference, category…")
+    search_col, sort_col, dir_col = st.columns([5, 2, 2.4], vertical_alignment="bottom")
+    search = search_col.text_input("Search", placeholder="Search merchant, amount, note, reference, category…",
+                                   label_visibility="collapsed")
     frame = pd.DataFrame(rows)
     if frame.empty:
         st.info("No transactions are available yet.")
@@ -2214,32 +2271,33 @@ elif page == "Transactions":
     frame["Split"] = [("🔒 Split original" if status == "split" else f"↳ Line of #{int(parent)}" if pd.notna(parent)
                        else "Needs split" if int(linked or 0) >= 2 else "")
                       for status, parent, linked in zip(frame["status"], frame["split_parent_id"], frame["linked_checks"])]
-    f1, f2, f3, f4, f5 = st.columns(5)
-    with f1:
-        account_filters = st.multiselect("Accounts", sorted(frame["account"].dropna().unique()),
-                                         placeholder="All accounts")
-    with f2:
-        category_filters = st.multiselect("Categories", sorted(frame["category"].unique()),
-                                          placeholder="All categories")
-    with f3:
-        treatment_filters = st.multiselect("Treatments", sorted(frame["treatment"].dropna().unique()),
-                                           placeholder="All treatments")
-    with f4:
-        status_options = sorted(frame["status"].dropna().unique())
-        status_filters = st.multiselect("Statuses", status_options, key="txn_status_filter",
-                                        default=["needs_review"] if "needs_review" in status_options else [],
-                                        placeholder="All statuses")
-    with f5:
-        side_filters = st.multiselect("Debit / Credit", ["Debit", "Credit"], placeholder="Both")
-    valid_dates = frame["transaction_date"].dropna()
-    date_value = (valid_dates.min().date(), valid_dates.max().date()) if not valid_dates.empty else (date.today(), date.today())
-    dr1, dr2 = st.columns([2, 1])
-    selected_dates = dr1.date_input("Transaction date range", value=date_value)
-    split_filters = dr2.multiselect("Split status", ["Needs split", "🔒 Split original", "↳ Split line"],
-                                    placeholder="All transactions",
-                                    help="Needs split: a bank transaction with 2 or more checks in the check register that "
-                                         "hasn't been split yet. Split original: locked until its split is reverted. "
-                                         "Split line: one of the lines a split created.")
+    with st.expander("Filters: accounts, categories, treatment, status, dates, split", expanded=False):
+        f1, f2, f3, f4, f5 = st.columns(5)
+        with f1:
+            account_filters = st.multiselect("Accounts", sorted(frame["account"].dropna().unique()),
+                                             placeholder="All accounts")
+        with f2:
+            category_filters = st.multiselect("Categories", sorted(frame["category"].unique()),
+                                              placeholder="All categories")
+        with f3:
+            treatment_filters = st.multiselect("Treatments", sorted(frame["treatment"].dropna().unique()),
+                                               placeholder="All treatments")
+        with f4:
+            status_options = sorted(frame["status"].dropna().unique())
+            status_filters = st.multiselect("Statuses", status_options, key="txn_status_filter",
+                                            default=["needs_review"] if "needs_review" in status_options else [],
+                                            placeholder="All statuses")
+        with f5:
+            side_filters = st.multiselect("Debit / Credit", ["Debit", "Credit"], placeholder="Both")
+        valid_dates = frame["transaction_date"].dropna()
+        date_value = (valid_dates.min().date(), valid_dates.max().date()) if not valid_dates.empty else (date.today(), date.today())
+        dr1, dr2 = st.columns([2, 1])
+        selected_dates = dr1.date_input("Transaction date range", value=date_value)
+        split_filters = dr2.multiselect("Split status", ["Needs split", "🔒 Split original", "↳ Split line"],
+                                        placeholder="All transactions",
+                                        help="Needs split: a bank transaction with 2 or more checks in the check register that "
+                                             "hasn't been split yet. Split original: locked until its split is reverted. "
+                                             "Split line: one of the lines a split created.")
     filtered = frame.copy()
     if search.strip():
         searchable = filtered.fillna("").astype(str).agg(" | ".join, axis=1)
@@ -2267,27 +2325,23 @@ elif page == "Transactions":
         start_date, end_date = selected_dates
         filtered = filtered[(filtered["transaction_date"].dt.date >= start_date) &
                             (filtered["transaction_date"].dt.date <= end_date)]
-    sort1, sort2 = st.columns([2, 1])
     sortable_columns = {
         "Date": "transaction_date", "Account": "account", "Description": "description",
         "Amount": "signed_amount", "Debit / Credit": "Debit / Credit", "Category": "category", "Treatment": "treatment",
         "Status": "status", "Reference": "source_reference", "Notes": "notes",
         "Counterparty / loan party": "counterparty", "Loan role": "loan_role", "From": "From", "To": "To",
     }
-    with sort1:
-        sort_label = st.selectbox("Sort by", list(sortable_columns))
-    with sort2:
-        sort_direction = st.radio("Direction", ["Newest / Z–A", "Oldest / A–Z"], horizontal=True)
+    sort_label = sort_col.selectbox("Sort by", list(sortable_columns), label_visibility="collapsed")
+    sort_direction = dir_col.radio("Direction", ["Newest / Z–A", "Oldest / A–Z"], horizontal=True,
+                                   label_visibility="collapsed")
     filtered = filtered.sort_values(sortable_columns[sort_label],
                                     ascending=sort_direction == "Oldest / A–Z", na_position="last")
     filtered["transaction_date"] = filtered["transaction_date"].dt.strftime("%Y-%m-%d")
-    r1, r2 = st.columns([3, 1])
-    with r1:
-        st.caption(f"Showing {len(filtered):,} of {len(frame):,} transactions")
-    with r2:
-        st.download_button("Download filtered CSV", filtered.to_csv(index=False).encode("utf-8"),
-                           file_name=f"{db.slugify(business_name)}-filtered-transactions.csv",
-                           mime="text/csv", width="stretch")
+    r1, r2, r3 = st.columns([5, 0.6, 4], vertical_alignment="center")
+    r1.caption(f"Showing {len(filtered):,} of {len(frame):,} transactions")
+    r2.download_button("⤓", filtered.to_csv(index=False).encode("utf-8"),
+                       file_name=f"{db.slugify(business_name)}-filtered-transactions.csv",
+                       mime="text/csv", help="Download the filtered rows as CSV")
     category_by_name = {item["name"]: item for item in categories}
     def render_split_log() -> None:
         with db.connect(DB_PATH) as connection:
@@ -2316,14 +2370,12 @@ elif page == "Transactions":
                     rerun()
 
     st.session_state.setdefault("txn_edit_window", True)
-    window_mode = st.toggle("Edit in a window: click a row to open it", key="txn_edit_window",
+    window_mode = r3.toggle("Edit in a window: click a row to open it", key="txn_edit_window",
                             help="Streamlit tables cannot detect a double-click, so a single click on any cell opens the edit window. "
                                  "Turn this off for the spreadsheet grid and bulk actions.")
     if window_mode:
         pick_columns = ["id", "transaction_date", "description", "signed_amount", "Debit / Credit", "category",
                         "treatment", "From", "To", "counterparty", "status", "Split", "notes", "account"]
-        st.caption("Click any cell in a row to edit it in a window, with Previous / Next to move through the list. "
-                   "Turn the switch off for the spreadsheet grid and bulk actions.")
         nav_ids = [int(value) for value in filtered["id"].tolist()]
         st.session_state["txn_nav_ids"] = nav_ids
         if st.session_state.pop("txn_clear_pick", False):
@@ -3257,6 +3309,50 @@ elif page == "Staff & Payroll":
             if not paid_rows and not revenue_rows:
                 st.info("Nothing in this period for the selection.")
             st.caption("Revenue counts only the deposits you picked and saved. Paid to staff is the amounts you entered.")
+
+elif page == "Ask Your Books":
+    page_header("Ask your books",
+                "Type a question in plain words. It searches your transactions, checks, notes and names on this computer only.",
+                "Search")
+    st.session_state.setdefault("ask_text", "")
+    ask_text = st.text_input("Question", key="ask_text", label_visibility="collapsed",
+                             placeholder="e.g.  Makesh payments 2026   ·   checks over 5000   ·   revenue Colina sept by month")
+    with st.expander("What can I ask?"):
+        st.markdown(
+            "- **Names / words**: `AlgebraIT`, `Makesh payment`, `invoice 1042` (every word must match)\n"
+            "- **Money**: `over 5000`, `under 200`, `between 1000 and 2000`, `$1,250.50`\n"
+            "- **Dates**: `2026`, `sept`, `march 2025`, `2026-03`, `last month`, `this year`\n"
+            "- **Type**: `revenue`, `expenses`, `payments`, `loans`, `transfers`, `refunds`, `checks`, `check 1042`, `needs review`\n"
+            "- **Category**: any category name of the business\n"
+            "- **Group**: add `by month`, `by vendor`, `by category`, `by year`, `by account`\n"
+            "- **Scope**: searches the selected business; add `all businesses` to search every company")
+    if ask_text.strip():
+        with db.connect(DB_PATH) as connection:
+            category_names = [item["name"] for item in db.list_categories(connection, business_id)]
+            parsed = ask_mod.parse(ask_text, category_names, [])
+            found = ask_mod.run(connection, parsed, business_id)
+        st.markdown("**Understood as:** " + "  ·  ".join(f"`{part}`" for part in ask_mod.describe(parsed))
+                    if ask_mod.describe(parsed) else "**Understood as:** everything")
+        summary_totals = ask_mod.totals(found)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Matches", f"{summary_totals['count']:,}")
+        m2.metric("Money in", money(summary_totals["in"]))
+        m3.metric("Money out", money(summary_totals["out"]))
+        m4.metric("Net", money(summary_totals["net"]))
+        if not found:
+            st.info("Nothing matched. Try fewer words, or add `all businesses`.")
+        else:
+            if parsed.group_by:
+                st.dataframe(pd.DataFrame(ask_mod.group(found, parsed.group_by)), hide_index=True, width="stretch")
+            result_frame = pd.DataFrame(found).drop(columns=["id", "business_id"])
+            if not parsed.all_businesses:
+                result_frame = result_frame.drop(columns=["Business"])
+            st.dataframe(result_frame, hide_index=True, width="stretch",
+                         column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            st.download_button("Download these rows (CSV)", result_frame.to_csv(index=False),
+                               file_name="ask-results.csv", mime="text/csv")
+            if len(found) >= 2000:
+                st.caption("Showing the newest 2,000 matches. Narrow the question to see the rest.")
 
 elif page == "Parties":
     page_header("Everyone you do business with",

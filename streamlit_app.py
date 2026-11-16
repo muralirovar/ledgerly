@@ -87,7 +87,7 @@ st.markdown("""
   [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap: .72rem;}
   [data-testid="stSidebar"] label, [data-testid="stSidebar"] p, [data-testid="stSidebar"] span {color: #dce7ef;}
   [data-testid="stSidebar"] [role="radiogroup"] {gap: .25rem;}
-  [data-testid="stSidebar"] [role="radiogroup"] label {padding: .72rem .85rem; border-radius: 10px; transition: .15s ease;}
+  [data-testid="stSidebar"] [role="radiogroup"] label {padding: .3rem .7rem; border-radius: 10px; transition: .15s ease;}
   [data-testid="stSidebar"] label[data-testid="stRadioOption"] > div > div:first-child {display:none;}
   [data-testid="stSidebar"] [role="radiogroup"] label:hover {background: rgba(255,255,255,.08);}
   [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {background: rgba(255,255,255,.14); box-shadow: inset 3px 0 0 #f0b73f;}
@@ -106,6 +106,7 @@ st.markdown("""
   [data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"]:hover {background:rgba(255,255,255,.08) !important;}
   [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {background:rgba(255,255,255,.14) !important; box-shadow:inset 3px 0 0 #f0b73f !important;}
   [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] p {color:#fff; font-weight:650;}
+  .nav-group {font-size:.7rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:#9fc3dc; margin:.5rem 0 -.2rem .3rem;}
   [data-testid="stSidebar"] hr {border-color: rgba(255,255,255,.12);}
   .brand {padding: .45rem .2rem 1.15rem; display:flex; align-items:center; gap:.8rem;}
   .brand-logo {background:#fff; border-radius:12px; padding:.55rem .8rem; box-shadow:0 8px 24px rgba(0,0,0,.22); display:flex; align-items:center;}
@@ -604,11 +605,17 @@ NAV_GROUPS = {
     "Setup": ["◇  Accounts & credit", "⚙  Manage business", "↓  Export & settings", "🛡  Admin & backup"],
 }
 nav_choice = st.session_state["nav_choice"]
+
+def pick_nav(group_name: str) -> None:
+    st.session_state["nav_choice"] = st.session_state[f"nav_radio_{group_name}"]
+
 for group_name, group_items in NAV_GROUPS.items():
+    # keep each group's radio in sync with the current page (None when the page is in another group)
+    st.session_state[f"nav_radio_{group_name}"] = nav_choice if nav_choice in group_items else None
     with st.sidebar.expander(group_name, expanded=nav_choice in group_items):
-        for item in group_items:
-            st.button(item, key=f"nav_btn_{item}", width="stretch", on_click=go_to, args=(item,),
-                      type="primary" if item == nav_choice else "tertiary")
+        st.radio(group_name, group_items, index=None, key=f"nav_radio_{group_name}",
+                 format_func=lambda label: label.split("  ", 1)[-1],
+                 on_change=pick_nav, args=(group_name,), label_visibility="collapsed")
 page = nav[nav_choice]
 
 def render_admin() -> None:

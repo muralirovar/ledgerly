@@ -2444,10 +2444,7 @@ elif page == "Transactions":
                     st.session_state["txn_saved_message"] = f"Reverted split #{pick}: {removed} line(s) removed."
                     rerun()
 
-    st.session_state.setdefault("txn_edit_window", True)
-    window_mode = r3.toggle("Edit in a window: click a row to open it", key="txn_edit_window",
-                            help="Streamlit tables cannot detect a double-click, so a single click on any cell opens the edit window. "
-                                 "Turn this off for the spreadsheet grid and bulk actions.")
+    window_mode = True
     if window_mode:
         pick_columns = ["id", "transaction_date", "description", "signed_amount", "Debit / Credit", "category",
                         "treatment", "From", "To", "counterparty", "status", "Split", "notes", "account"]

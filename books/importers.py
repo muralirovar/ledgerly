@@ -99,7 +99,7 @@ def parse_csv_text(text: str, fmt: str = "auto") -> list[dict[str, Any]]:
         if not all((date_col, desc_col, amount_col)):
             raise ValueError("Pasted rows need Date, Description, and Amount columns")
         for index, row in enumerate(reader, start=1):
-            if not row.get(amount_col):
+            if not row.get(amount_col) or money(row[amount_col]) == 0:
                 continue
             rows.append({"transaction_date": iso_date(row[date_col]), "posting_date": iso_date(row[date_col]),
                          "description": row[desc_col].strip(), "source_amount": money(row[amount_col]),
@@ -107,10 +107,35 @@ def parse_csv_text(text: str, fmt: str = "auto") -> list[dict[str, Any]]:
     return rows
 
 
-def preview_csv(text: str, account_type: str, fmt: str = "auto") -> list[dict[str, Any]]:
+PAYMENT_WORDS = re.compile(r"payment|pymt|pmt|thank you|autopay|credit", re.I)
+
+
+def card_payments_positive(rows: list[dict[str, Any]]) -> bool:
+    """True when the lines that look like payments to the card are positive numbers (charges negative)."""
+    signs = [row["source_amount"] > 0 for row in rows if PAYMENT_WORDS.search(row["description"]) and row["source_amount"]]
+    return bool(signs) and sum(signs) * 2 > len(signs)
+
+
+def preview_csv(text: str, account_type: str, fmt: str = "auto", payments_are: str = "auto") -> list[dict[str, Any]]:
+    """Parse rows and add the cash-view signed amount.
+
+    Card files usually show charges as positive and payments as negative; some (for example a pasted
+    statement) show the opposite. ``payments_are`` is "positive", "negative" or "auto" (decided from
+    the lines that say payment, only for pasted or generic rows).
+    """
+    detected = detect_format(text) if fmt == "auto" else fmt
     rows = parse_csv_text(text, fmt)
+    flip = False
+    if account_type == "credit_card":
+        if payments_are == "positive":
+            flip = True
+        elif payments_are == "auto" and detected == "generic":
+            flip = card_payments_positive(rows)
     for row in rows:
-        row["signed_amount"] = -row["source_amount"] if account_type == "credit_card" else row["source_amount"]
+        if account_type == "credit_card":
+            row["signed_amount"] = row["source_amount"] if flip else -row["source_amount"]
+        else:
+            row["signed_amount"] = row["source_amount"]
     return rows
 
 

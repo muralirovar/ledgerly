@@ -941,6 +941,14 @@ class BooksTests(unittest.TestCase):
             self.assertEqual((rows[0]["vendor"], rows[0]["paid_bank"], rows[0]["paid_card"]), ("Acme Staffing", 900.0, 50.0))
             self.assertEqual(db.vendor_1099_report(c, self.business, "2025-01-01", "2025-12-31", ["IT Staffing Expense"]), [])
 
+    def test_card_paste_sign_detection(self):
+        text = ("Date,Description,Amount\n11/2/26,PAYMENT MADE BY ACCOUNT ENDING IN:4941,200\n"
+                "9/21/26,BALANCE TRANSFER FEE,-150\n8/18/26,ANNUAL MEMBERSHIP FEE,0\n")
+        rows = importers.preview_csv(text, "credit_card")
+        self.assertEqual([r["signed_amount"] for r in rows], [200.0, -150.0])
+        usual = importers.preview_csv("Date,Description,Amount\n1/2/26,ONLINE PAYMENT,-60\n1/3/26,SHOP,25\n", "credit_card")
+        self.assertEqual([r["signed_amount"] for r in usual], [60.0, -25.0])
+
     def test_summary_and_mileage(self):
         from books import mileage, summary
         with db.connect(self.path) as connection:

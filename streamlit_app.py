@@ -1280,6 +1280,13 @@ elif page == "Import / Paste":
         payments_are = {"Positive numbers": "positive", "Negative numbers": "negative"}.get(choice, "auto")
         st.caption("Advances become loan draws, payments become principal repayments, and interest and fees become "
                    "expense. Lines that match a checking transaction of the same amount are reconciled automatically.")
+    card_payments_are = "auto"
+    if selected_account["account_type"] == "credit_card":
+        card_choice = st.radio("In this file, payments to the card are shown as",
+                               ["Detect automatically", "Negative numbers", "Positive numbers"], horizontal=True,
+                               help="Most card downloads show charges as positive and payments as negative. "
+                                    "Pasted statements often show the opposite.")
+        card_payments_are = {"Negative numbers": "negative", "Positive numbers": "positive"}.get(card_choice, "auto")
     preview_key = f"preview_{business_id}_{selected_account['id']}"
     if st.button("Preview", disabled=not (bool(text.strip()) or pdf_bytes), type="primary"):
         try:
@@ -1289,7 +1296,7 @@ elif page == "Import / Paste":
                     raise ValueError("No transaction lines found. Paste or upload rows with Date, Description and Amount.")
                 st.session_state[preview_key] = loc_mod.orient(parsed_rows, payments_are)
             else:
-                st.session_state[preview_key] = importers.preview_csv(text, selected_account["account_type"])
+                st.session_state[preview_key] = importers.preview_csv(text, selected_account["account_type"], payments_are=card_payments_are)
             st.session_state[preview_key + "_name"] = source_name
         except Exception as exc:
             st.error(str(exc))
@@ -2444,11 +2451,10 @@ elif page == "Transactions":
                     st.session_state["txn_saved_message"] = f"Reverted split #{pick}: {removed} line(s) removed."
                     rerun()
 
-    window_mode = True
-    _pick_state = st.session_state.get("txn_pick_grid")
-    _has_pick = bool(_pick_state and _pick_state.get("selection", {}).get("rows")) if hasattr(_pick_state, "get") else False
-    edit_again = r3.button("✎  Edit", key="txn_edit_button", disabled=not _has_pick,
-                           help="Tick the box at the left of a row to open it in a window. Use this to reopen the ticked row after closing.")
+    st.session_state.setdefault("txn_edit_window", True)
+    window_mode = r3.toggle("Edit in a window: click any cell to open it", key="txn_edit_window",
+                            help="On: a click on any cell opens the transaction in a window. "
+                                 "Off: the spreadsheet grid for editing in line and bulk actions.")
     if window_mode:
         pick_columns = ["id", "transaction_date", "description", "signed_amount", "Debit / Credit", "category",
                         "treatment", "From", "To", "counterparty", "status", "Split", "notes", "account"]
@@ -2459,7 +2465,7 @@ elif page == "Transactions":
             st.session_state["txn_pick_seen"] = None
         pick_grid = st.dataframe(
             filtered[pick_columns].rename(columns={"id": "#"}), hide_index=True, width="stretch", height=650,
-            on_select="rerun", selection_mode="single-row", key="txn_pick_grid",
+            on_select="rerun", selection_mode=["single-cell", "single-row"], key="txn_pick_grid",
             column_config={"signed_amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
                            "description": st.column_config.TextColumn(width="large")})
 
@@ -2686,13 +2692,15 @@ elif page == "Transactions":
                 close_txn_dialog()
                 st.rerun()
 
-        picked_position = pick_grid.selection.rows[0] if pick_grid.selection.rows else None
+        picked_position = (pick_grid.selection.cells[0][0] if pick_grid.selection.cells
+                           else pick_grid.selection.rows[0] if pick_grid.selection.rows else None)
         if picked_position is not None:
             picked = int(filtered.iloc[picked_position]["id"])
-            if st.session_state.get("txn_pick_seen") != picked or edit_again:
+            if st.session_state.get("txn_pick_seen") != picked:
                 st.session_state["txn_pick_seen"] = picked
                 st.session_state["txn_dialog_id"] = picked
-            edit_transaction_dialog()
+            if st.session_state.get("txn_dialog_id"):
+                edit_transaction_dialog()
         elif st.session_state.get("txn_dialog_id"):
             edit_transaction_dialog()
         if st.session_state.get("txn_saved_message"):

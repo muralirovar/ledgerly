@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from html import escape
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import base64
 import hmac
@@ -169,6 +169,10 @@ def money(value: float) -> str:
     return f"${value:,.2f}"
 
 
+def utc_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+
 def rerun() -> None:
     st.rerun()
 
@@ -212,6 +216,21 @@ def period_picker(prefix: str, container=None) -> tuple[str | None, str | None]:
             return picked[0].isoformat(), picked[1].isoformat()
         return None, None
     return f"{choice}-01-01", f"{choice}-12-31"
+
+
+def party_picker(container, label: str, value: str, key: str, parties: list[str], help: str | None = None,
+                 placeholder: str = "Type to search or enter a new name") -> str:
+    """Autocomplete for a From / To / counterparty name: pick an existing party or type a new one."""
+    if key in st.session_state and st.session_state[key] == "":
+        st.session_state[key] = None
+    current = (st.session_state.get(key) if key in st.session_state else value) or ""
+    options = list(parties)
+    if current and current not in options:
+        options.insert(0, current)
+    kwargs = {} if key in st.session_state else {"index": options.index(current) if current in options else None}
+    choice = container.selectbox(label, options, key=key, accept_new_options=True, help=help,
+                                 placeholder=placeholder, **kwargs)
+    return (choice or "").strip()
 
 
 def csv_download(label: str, frame: pd.DataFrame, file_stem: str, key: str) -> None:
@@ -610,7 +629,7 @@ if businesses:
     business_id = int(business_by_name[business_name]["id"])
 nav = {
     "▦  Dashboard": "Dashboard", "↗  Revenue & expense": "Revenue & Expense",
-    "▣  Tax prep": "Tax Prep", "⛟  Tax & business miles": "Mileage", "♙  Personal tax prep": "Personal Tax Prep",
+    "▣  Tax prep": "Tax Prep", "⛟  Tax & business miles": "Mileage", "▦  1099 vendors": "1099 Vendors", "♙  Personal tax prep": "Personal Tax Prep",
     "⇧  Import transactions": "Import / Paste",
     "▤  Statements & checks": "Statements & Checks",
     "＄  Deposits": "Deposits", "✓  Review queue": "Review Queue", "≡  All transactions": "Transactions",
@@ -626,7 +645,7 @@ NAV_GROUPS = {
     "Bookkeeping": ["⇧  Import transactions", "▤  Statements & checks", "＄  Deposits", "✓  Review queue",
                     "≡  All transactions"],
     "People & payroll": ["☻  Staff & payroll", "☷  Parties", "⌁  Categories & rules"],
-    "Tax": ["▣  Tax prep", "♙  Personal tax prep", "⛟  Tax & business miles"],
+    "Tax": ["▣  Tax prep", "♙  Personal tax prep", "▦  1099 vendors", "⛟  Tax & business miles"],
     "Setup": ["◇  Accounts & credit", "⚙  Manage business", "↓  Export & settings", "🛡  Admin & backup"],
 }
 nav_choice = st.session_state["nav_choice"]
@@ -1254,6 +1273,48 @@ elif page == "Import / Paste":
     account_by_name = {item["name"]: item for item in accounts}
     selected_account_name = st.selectbox("Account", list(account_by_name))
     selected_account = account_by_name[selected_account_name]
+    with st.expander("＋ Add one transaction"):
+        with db.connect(DB_PATH) as connection:
+            add_categories = db.list_categories(connection, business_id)
+        add_category_by_name = {c["name"]: c for c in add_categories}
+        with st.form("add_one_transaction", clear_on_submit=True):
+            a1, a2, a3, a4 = st.columns([1, 3, 1.3, 1.3])
+            add_date = a1.date_input("Date", value=date.today(), key="add_txn_date", format="MM/DD/YYYY")
+            add_description = a2.text_input("Description", key="add_txn_description")
+            add_amount = a3.number_input("Amount", min_value=0.0, step=0.01, format="%.2f", key="add_txn_amount")
+            add_direction = a4.radio("Money", ["Out", "In"], horizontal=True, key="add_txn_direction")
+            with db.connect(DB_PATH) as connection:
+                add_parties = db.known_parties(connection, business_id)
+            add_party = party_picker(st, "From / To (who sent or received it, optional)", "", "add_txn_party", add_parties)
+            b1, b2, b3 = st.columns([2, 1.5, 3])
+            add_category = b1.selectbox("Category (optional)", ["— none —"] + list(add_category_by_name), key="add_txn_category")
+            add_treatment = b2.selectbox("Treatment", list(db.TREATMENTS), index=len(db.TREATMENTS) - 1, key="add_txn_treatment")
+            add_notes = b3.text_input("Note (optional)", key="add_txn_notes")
+            if st.form_submit_button("Add transaction", type="primary"):
+                signed = -float(add_amount) if add_direction == "Out" else float(add_amount)
+                source = -signed if selected_account["account_type"] == "credit_card" else signed
+                problem = db.loan_direction_error(signed, add_treatment) if add_treatment != "Needs review" else None
+                if not add_description.strip() or not add_amount:
+                    st.error("Enter a description and an amount.")
+                elif problem:
+                    st.error(problem)
+                else:
+                    with db.connect(DB_PATH) as connection:
+                        txn_id, duplicate, _ = db.insert_transaction(
+                            connection, business_id=business_id, account_id=int(selected_account["id"]),
+                            transaction_date=add_date.isoformat(), posting_date=add_date.isoformat(),
+                            description=add_description.strip(), source_amount=source, signed_amount=signed,
+                            category_id=int(add_category_by_name[add_category]["id"]) if add_category in add_category_by_name else None,
+                            treatment=add_treatment, status="confirmed" if add_treatment != "Needs review" else "needs_review",
+                            notes=add_notes.strip() or None, source_file="manual entry",
+                            source_reference=f"manual-{utc_stamp()}")
+                        if add_party and not duplicate:
+                            db.set_transaction_counterparty(connection, business_id=business_id,
+                                                            transaction_id=txn_id, counterparty=add_party)
+                    if duplicate:
+                        st.warning("That transaction is already recorded.")
+                    else:
+                        st.success(f"Added {add_description.strip()} · {money(abs(signed))} {'out' if signed < 0 else 'in'} · {selected_account_name}.")
     is_loc = selected_account["account_type"] == "line_of_credit"
     mode = st.radio("Input", ["Upload CSV", "Paste rows"], horizontal=True)
     text = ""
@@ -1654,6 +1715,8 @@ elif page == "Statements & Checks":
                         "Transfer": "Transferred to / from",
                     }.get(treatment, "Counterparty — paid to or received from")
                     payee_key = f"check_payee_{active_image_name}_{chosen['check_number']}"
+                    with db.connect(DB_PATH) as connection:
+                        check_parties = db.known_parties(connection, business_id)
                     memo_key = f"check_memo_{active_image_name}_{chosen['check_number']}"
                     history_key = f"check_history_{active_image_name}_{chosen['check_number']}"
                     with db.connect(DB_PATH) as connection:
@@ -1682,8 +1745,8 @@ elif page == "Statements & Checks":
                         transaction_label = st.selectbox("Existing transaction match", candidate_labels, index=candidate_index)
                         st.text_input("From (us)", value=f"{business_name} · {selected_account_name}", disabled=True,
                                       key=f"check_from_{active_image_name}_{chosen['check_number']}")
-                        payee = st.text_input(f"To · {counterparty_label}", key=payee_key,
-                                              placeholder="Read from the check image")
+                        payee = party_picker(st, f"To · {counterparty_label}", "", payee_key, check_parties,
+                                             placeholder="Read from the check image, or search")
                         memo = st.text_input("Memo / purpose", key=memo_key, placeholder="Optional")
                         saved_written_date = (existing.get("written_date") if existing else None) or chosen["cleared_date"]
                         written_date = st.date_input("Date written", value=pd.to_datetime(saved_written_date).date())
@@ -2133,10 +2196,10 @@ elif page == "Deposits":
                        else "Loan TO (borrower repaying you)")
             c2.markdown(f"**{heading}**")
             party_pick = c2.selectbox("Choose existing party", ["＋ New name…"] + party_names, key=f"dep_party_pick_{treatment}")
-            counterparty = (c2.text_input("New party name", key=f"dep_party_new_{treatment}")
+            counterparty = (party_picker(c2, "New party name", "", f"dep_party_new_{treatment}", party_names)
                             if party_pick == "＋ New name…" else party_pick)
         else:
-            counterparty = c2.text_input(labels[treatment], key=f"dep_party_{treatment}")
+            counterparty = party_picker(c2, labels[treatment], "", f"dep_party_{treatment}", party_names)
         category_id = None
         related_id = None
         if treatment == "Revenue":
@@ -2279,17 +2342,19 @@ elif page == "Review Queue":
             "Expense refund": "Refund received from",
             "Transfer": "Transferred to / from",
         }.get(treatment, "Counterparty name")
+        with db.connect(DB_PATH) as connection:
+            review_parties = db.known_parties(connection, business_id)
         money_in_row = float(row["signed_amount"]) >= 0
         our_side = f"{business_name} · {row['account']}"
         ft1, ft2 = st.columns(2)
         if money_in_row:
-            vendor_name = ft1.text_input("From (who sent it)", value=suggested_pattern, key=f"review_vendor_{row['id']}",
-                                         help=f"{counterparty_label}. Saved as the party on this transaction.")
+            vendor_name = party_picker(ft1, "From (who sent it)", suggested_pattern, f"review_vendor_{row['id']}", review_parties,
+                                       help=f"{counterparty_label}. Saved as the party on this transaction.")
             ft2.text_input("To (us)", value=our_side, disabled=True, key=f"review_to_{row['id']}")
         else:
             ft1.text_input("From (us)", value=our_side, disabled=True, key=f"review_from_{row['id']}")
-            vendor_name = ft2.text_input("To (who received it)", value=suggested_pattern, key=f"review_vendor_{row['id']}",
-                                         help=f"{counterparty_label}. Saved as the party on this transaction.")
+            vendor_name = party_picker(ft2, "To (who received it)", suggested_pattern, f"review_vendor_{row['id']}", review_parties,
+                                       help=f"{counterparty_label}. Saved as the party on this transaction.")
         save_vendor = st.checkbox("Save this counterparty mapping", value=True,
                                   key=f"review_save_vendor_{row['id']}",
                                   help="Future matching transactions will receive this category and treatment automatically.")
@@ -2627,12 +2692,14 @@ elif page == "Transactions":
                 st.info(f"This is one line of the split of transaction #{txn['split_parent_id']}. "
                         "Its amount is fixed. To change the split itself, open the locked original and revert it first.")
             fr, to = st.columns(2)
+            with db.connect(DB_PATH) as connection:
+                dialog_parties = db.known_parties(connection, business_id)
             if amount >= 0:
-                party = fr.text_input("From (who sent it)", value=txn["counterparty"] or "", key="txd_party" + suffix)
+                party = party_picker(fr, "From (who sent it)", txn["counterparty"] or "", "txd_party" + suffix, dialog_parties)
                 to.text_input("To (us)", value=ours, disabled=True, key="txd_us" + suffix)
             else:
                 fr.text_input("From (us)", value=ours, disabled=True, key="txd_us" + suffix)
-                party = to.text_input("To (who received it)", value=txn["counterparty"] or "", key="txd_party" + suffix)
+                party = party_picker(to, "To (who received it)", txn["counterparty"] or "", "txd_party" + suffix, dialog_parties)
             d1, d2 = st.columns(2)
             cat_options = ["Uncategorized"] + list(category_by_name)
             current_cat = txn["category_name"] if txn["category_name"] in category_by_name else "Uncategorized"
@@ -2852,7 +2919,7 @@ elif page == "Reports":
                 "Loan positions by party, everything kept out of profit and loss, and revenue and expense by vendor or party.",
                 "Reports")
     r_start, r_end = period_picker("reports")
-    tab_loans, tab_excluded, tab_vendor, tab_margin, tab_1099 = st.tabs(["Loans", "Excluded from P&L", "By vendor / party", "Margin", "1099 vendors"])
+    tab_loans, tab_excluded, tab_vendor, tab_margin = st.tabs(["Loans", "Excluded from P&L", "By vendor / party", "Margin"])
     with db.connect(DB_PATH) as connection:
         loan_rows = db.loan_report(connection, business_id, r_start, r_end)
         loan_ledger_rows = db.loan_ledger(connection, business_id, r_start, r_end)
@@ -3032,38 +3099,6 @@ elif page == "Reports":
             st.caption("The vendor is the party on the transaction, else the bank-text rule (Parties page) that matches it. "
                        "Loans, transfers and owner contributions are not included.")
             csv_download("Download vendor report (CSV)", vendor_frame, "revenue-expense-by-vendor", "dl_vendor_report")
-
-    with tab_1099:
-        with db.connect(DB_PATH) as connection:
-            all_cats = [c["name"] for c in db.list_categories(connection, business_id)]
-        guess = [n for n in all_cats if re.search(r"\bit\b.*serv|staffing", n.lower())
-                 and not re.search(r"revenue|refund", n.lower())]
-        x1, x2 = st.columns([1, 3])
-        year_1099 = x1.number_input("Tax year", 2020, 2100, int(date.today().year) - (1 if date.today().month < 7 else 0),
-                                    key="v1099_year")
-        chosen_cats = x2.multiselect("Expense categories", all_cats, default=guess, key="v1099_cats",
-                                     help="Categories whose payments to vendors are reported on a 1099. Pre-selected: IT services and staffing.")
-        with db.connect(DB_PATH) as connection:
-            rows_1099 = db.vendor_1099_report(connection, business_id, f"{int(year_1099)}-01-01",
-                                              f"{int(year_1099)}-12-31", chosen_cats)
-        if not rows_1099:
-            st.info("No expenses in those categories for that year.")
-        else:
-            frame_1099 = pd.DataFrame(rows_1099).rename(columns={
-                "vendor": "Vendor", "categories": "Categories", "paid_bank": "Paid by bank / check",
-                "paid_card": "Paid by card", "total": "Total paid", "payments": "Payments",
-                "first_payment": "First payment", "last_payment": "Last payment"})
-            frame_1099["1099 needed (bank ≥ $600)"] = frame_1099["Paid by bank / check"].apply(lambda v: "Yes" if v >= 600 else "No")
-            k1, k2, k3 = st.columns(3)
-            with k1: metric_card("Vendors", f"{len(frame_1099)}", f"{int((frame_1099.iloc[:, -1] == 'Yes').sum())} at $600 or more by bank", "▥", "navy")
-            with k2: metric_card("Paid by bank / check", money(float(frame_1099["Paid by bank / check"].sum())), "Reported on 1099-NEC", "↘", "rose")
-            with k3: metric_card("Paid by card", money(float(frame_1099["Paid by card"].sum())), "Reported by card processor", "▭", "gold")
-            st.dataframe(frame_1099, hide_index=True, width="stretch", column_config={
-                c: st.column_config.NumberColumn(format="$%.2f") for c in ("Paid by bank / check", "Paid by card", "Total paid")})
-            st.caption("The vendor is the party on the transaction, else the bank-text rule that matches it. Card payments are "
-                       "shown separately because the card processor reports them (1099-K). Taxpayer ID and address are not "
-                       "stored here; collect a W-9 from each vendor.")
-            csv_download("Download 1099 vendor list (CSV)", frame_1099, f"1099-vendors-{int(year_1099)}", "dl_1099")
 
     with tab_margin:
         with db.connect(DB_PATH) as connection:
@@ -3506,6 +3541,40 @@ elif page == "Summary Sheet":
     st.markdown("**Method**")
     for note in data["method"]:
         st.caption(note)
+
+elif page == "1099 Vendors":
+    page_header("1099 vendors", "Who was paid in the IT services and staffing categories, for 1099 reporting.", "1099 vendors")
+    with db.connect(DB_PATH) as connection:
+        all_cats = [c["name"] for c in db.list_categories(connection, business_id)]
+    guess = [n for n in all_cats if re.search(r"\bit\b.*serv|staffing", n.lower())
+             and not re.search(r"revenue|refund", n.lower())]
+    x1, x2 = st.columns([1, 3])
+    year_1099 = x1.number_input("Tax year", 2020, 2100, int(date.today().year) - (1 if date.today().month < 7 else 0),
+                                key="v1099_year")
+    chosen_cats = x2.multiselect("Expense categories", all_cats, default=guess, key="v1099_cats",
+                                 help="Categories whose payments to vendors are reported on a 1099. Pre-selected: IT services and staffing.")
+    with db.connect(DB_PATH) as connection:
+        rows_1099 = db.vendor_1099_report(connection, business_id, f"{int(year_1099)}-01-01",
+                                          f"{int(year_1099)}-12-31", chosen_cats)
+    if not rows_1099:
+        st.info("No expenses in those categories for that year.")
+    else:
+        frame_1099 = pd.DataFrame(rows_1099).rename(columns={
+            "vendor": "Vendor", "categories": "Categories", "paid_bank": "Paid by bank / check",
+            "paid_card": "Paid by card", "total": "Total paid", "payments": "Payments",
+            "first_payment": "First payment", "last_payment": "Last payment"})
+        frame_1099["1099 needed (bank ≥ $600)"] = frame_1099["Paid by bank / check"].apply(lambda v: "Yes" if v >= 600 else "No")
+        k1, k2, k3 = st.columns(3)
+        with k1: metric_card("Vendors", f"{len(frame_1099)}", f"{int((frame_1099.iloc[:, -1] == 'Yes').sum())} at $600 or more by bank", "▥", "navy")
+        with k2: metric_card("Paid by bank / check", money(float(frame_1099["Paid by bank / check"].sum())), "Reported on 1099-NEC", "↘", "rose")
+        with k3: metric_card("Paid by card", money(float(frame_1099["Paid by card"].sum())), "Reported by card processor", "▭", "gold")
+        st.dataframe(frame_1099, hide_index=True, width="stretch", column_config={
+            c: st.column_config.NumberColumn(format="$%.2f") for c in ("Paid by bank / check", "Paid by card", "Total paid")})
+        st.caption("The vendor is the party on the transaction, else the bank-text rule that matches it. Card payments are "
+                   "shown separately because the card processor reports them (1099-K). Taxpayer ID and address are not "
+                   "stored here; collect a W-9 from each vendor.")
+        csv_download("Download 1099 vendor list (CSV)", frame_1099, f"1099-vendors-{int(year_1099)}", "dl_1099")
+
 
 elif page == "Mileage":
     page_header("Tax and business miles", "Log trips, set the per-mile rates and see the mileage deduction by year.",

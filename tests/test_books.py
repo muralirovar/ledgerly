@@ -949,6 +949,13 @@ class BooksTests(unittest.TestCase):
         usual = importers.preview_csv("Date,Description,Amount\n1/2/26,ONLINE PAYMENT,-60\n1/3/26,SHOP,25\n", "credit_card")
         self.assertEqual([r["signed_amount"] for r in usual], [60.0, -25.0])
 
+    def test_headerless_paste(self):
+        rows = importers.parse_csv_text("04/22/2026\tEthostrong\t-6000".replace("\t", ","))
+        self.assertEqual([(r["transaction_date"], r["description"], r["source_amount"]) for r in rows],
+                         [("2026-04-22", "Ethostrong", -6000.0)])
+        rows = importers.parse_csv_text("04/22/2026,ACME, INC,-12.50\n04/23/2026,Shop,3")
+        self.assertEqual([r["description"] for r in rows], ["ACME, INC", "Shop"])
+
     def test_summary_and_mileage(self):
         from books import mileage, summary
         with db.connect(self.path) as connection:

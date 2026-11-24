@@ -57,6 +57,30 @@ def detect_format(text: str) -> str:
     return "generic"
 
 
+def _add_header_if_missing(text: str) -> str:
+    """Pasted rows without a header line (date, description, amount) get one."""
+    lines = [line for line in text.replace("\ufeff", "").splitlines() if line.strip()]
+    if not lines:
+        return text
+    first = next(csv.reader([lines[0]]))
+    try:
+        iso_date(first[0])
+    except (ValueError, IndexError):
+        return text
+    if len(first) < 3:
+        return text
+    out = ["Date,Description,Amount"]
+    for line in lines:
+        fields = next(csv.reader([line]))
+        if len(fields) < 3:
+            continue
+        description = ",".join(fields[1:-1]).strip()
+        buffer = io.StringIO()
+        csv.writer(buffer).writerow([fields[0].strip(), description, fields[-1].strip()])
+        out.append(buffer.getvalue().strip())
+    return "\n".join(out)
+
+
 def parse_csv_text(text: str, fmt: str = "auto") -> list[dict[str, Any]]:
     fmt = detect_format(text) if fmt == "auto" else fmt
     rows: list[dict[str, Any]] = []
@@ -91,6 +115,7 @@ def parse_csv_text(text: str, fmt: str = "auto") -> list[dict[str, Any]]:
                          "source_amount": money(row["Amount"]), "source_category": row.get("Category name", ""),
                          "source_reference": row.get("Check/Serial #") or str(index), "raw": row})
     else:
+        text = _add_header_if_missing(text)
         reader = csv.DictReader(io.StringIO(text.strip()))
         names = {re.sub(r"[^a-z]", "", name.lower()): name for name in (reader.fieldnames or [])}
         date_col = names.get("date") or names.get("transactiondate") or names.get("posteddate")

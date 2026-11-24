@@ -250,11 +250,15 @@ def describe(query: Query) -> list[str]:
     return parts
 
 
-def run(connection: sqlite3.Connection, query: Query, business_id: int | None, limit: int = 2000) -> list[dict[str, Any]]:
+def run(connection: sqlite3.Connection, query: Query, business_id: int | None, limit: int = 2000,
+        allowed_ids: list[int] | None = None) -> list[dict[str, Any]]:
     where, params = ["t.status != 'split'"], []
     if business_id is not None and not query.all_businesses:
         where.append("t.business_id = ?")
         params.append(business_id)
+    elif allowed_ids is not None:
+        where.append(f"t.business_id IN ({','.join('?' * len(allowed_ids)) or 'NULL'})")
+        params += [int(i) for i in allowed_ids]
     if query.start:
         where.append("t.transaction_date BETWEEN ? AND ?")
         params += [query.start, query.end]
@@ -321,7 +325,7 @@ def run(connection: sqlite3.Connection, query: Query, business_id: int | None, l
     if not rows and query.category_names and query.category_words:
         from dataclasses import replace
         return run(connection, replace(query, category="", category_names=[], category_words=[],
-                                       terms=query.category_words + query.terms), business_id, limit)
+                                       terms=query.category_words + query.terms), business_id, limit, allowed_ids)
     for row in rows:
         row["Check"] = row.pop("Check_info") or ""
     return rows[:limit]

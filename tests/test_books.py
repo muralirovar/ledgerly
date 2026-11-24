@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from books import db, importers, loc, statements
+from books import access, auth, bundle, db, importers, loc, statements
 
 
 class BooksTests(unittest.TestCase):
@@ -955,6 +955,127 @@ class BooksTests(unittest.TestCase):
                          [("2026-04-22", "Ethostrong", -6000.0)])
         rows = importers.parse_csv_text("04/22/2026,ACME, INC,-12.50\n04/23/2026,Shop,3")
         self.assertEqual([r["description"] for r in rows], ["ACME, INC", "Shop"])
+
+    def test_access_control_and_ask_scope(self):
+        from books import ask
+        with db.connect(self.path) as c:
+            other = db.get_or_create_business(c, "Second Co")
+            other_account = db.get_or_create_account(c, other, "Checking", "checking")
+            for biz, acct, desc in ((self.business, self.account, "ALPHA VENDOR"), (other, other_account, "ALPHA SECRET")):
+                db.insert_transaction(c, business_id=biz, account_id=acct, transaction_date="2026-01-05",
+                    posting_date=None, description=desc, source_amount=-10, signed_amount=-10)
+            access.ensure_schema(c)
+            access.grant(c, "Acct", [self.business])
+            self.assertEqual(access.business_ids_for(c, "acct"), [self.business])
+            self.assertEqual(access.business_ids_for(c, "nobody"), [])
+            query = ask.parse("alpha all businesses", [], [])
+            seen = {r["Business"] for r in ask.run(c, query, self.business, allowed_ids=[self.business])}
+            self.assertEqual(seen, {"Test Business"})
+            self.assertEqual(len(ask.run(c, query, self.business)), 2)
+            access.grant(c, "acct", [self.business, other])
+            self.assertEqual(access.businesses_text(c)["acct"].count(","), 1)
+            self.assertEqual(access.revoke(c, "acct"), 2)
+            access.log(c, "A", "sign in", "editor")
+            access.log(c, "a", "view", business="Test Business", page="Dashboard")
+            access.log(c, "b", "failed sign in", "wrong")
+            self.assertEqual(len(access.audit(c, username="a")), 2)
+            self.assertEqual(len(access.audit(c, event="failed sign in")), 1)
+            self.assertEqual(len(access.audit(c, business="Test Business", since="2000-01-01", until="2999-01-01")), 1)
+            summary = {row["username"]: row for row in access.user_summary(c)}
+            self.assertEqual((summary["a"]["sign_ins"], summary["a"]["page_views"], summary["b"]["failures"]), (1, 1, 1))
+
+    def test_auth_password_mfa_lockout_recovery(self):
+        # RFC 6238 test vector (secret "12345678901234567890", time 59 -> 94287082; 6 digits -> 287082)
+        secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+        self.assertEqual(auth.totp_now(secret, at=59), "287082")
+        self.assertEqual(auth.matching_step(secret, "287082", at=59), 1)
+        self.assertIsNone(auth.matching_step(secret, "000000", at=59))
+        self.assertTrue(auth.verify_password("correct horse battery", auth.hash_password("correct horse battery")))
+        self.assertFalse(auth.verify_password("wrong", auth.hash_password("correct horse battery")))
+        with db.connect(self.path) as c:
+            auth.ensure_schema(c)
+            with self.assertRaises(ValueError):
+                auth.create_user(c, "boss", "short")
+            auth.create_user(c, "Boss", "correct horse battery", is_owner=True)
+            with self.assertRaises(ValueError):
+                auth.create_user(c, "boss", "correct horse battery")
+            self.assertEqual(auth.attempt_login(c, "boss", "correct horse battery", "")[0], "enroll")
+            mine = auth.new_secret()
+            with self.assertRaises(ValueError):
+                auth.enable_mfa(c, "boss", mine, "123456")
+            codes = auth.enable_mfa(c, "boss", mine, auth.totp_now(mine))
+            self.assertEqual(len(codes), 8)
+            # the code used to enrol cannot be replayed, a fresh step is needed
+            self.assertEqual(auth.attempt_login(c, "boss", "correct horse battery", auth.totp_now(mine))[0], "invalid")
+            future = auth._hotp(mine, int(__import__("time").time() // 30) + 1)
+            self.assertEqual(auth.attempt_login(c, "boss", "correct horse battery", future)[0], "ok")
+            self.assertEqual(auth.attempt_login(c, "boss", "correct horse battery", future)[0], "invalid")
+            self.assertEqual(auth.attempt_login(c, "boss", "correct horse battery", codes[0])[0], "ok")
+            self.assertEqual(auth.attempt_login(c, "boss", "correct horse battery", codes[0])[0], "invalid")
+            self.assertEqual(auth.recovery_codes_left(c, "boss"), 7)
+            self.assertEqual(auth.attempt_login(c, "nobody", "whatever whatever", "")[0], "invalid")
+            statuses = [auth.attempt_login(c, "boss", "bad password here", "")[0] for _ in range(5)]
+            self.assertEqual(statuses[-1], "locked")
+            self.assertEqual(auth.attempt_login(c, "boss", "correct horse battery", codes[1])[0], "locked")
+            with self.assertRaises(ValueError):
+                auth.delete_user(c, "boss")
+            auth.create_user(c, "helper", "another long password", must_change=True)
+            self.assertEqual(auth.attempt_login(c, "helper", "another long password", "")[0], "enroll")
+            auth.set_active(c, "helper", False)
+            self.assertEqual(auth.attempt_login(c, "helper", "another long password", "")[0], "disabled")
+
+    def test_business_bundle_round_trip(self):
+        with db.connect(self.path) as c:
+            tid = db.insert_transaction(c, business_id=self.business, account_id=self.account, transaction_date="2026-02-01",
+                posting_date=None, description="BIG DEPOSIT", source_amount=1000, signed_amount=1000)[0]
+            db.classify_transaction(c, tid, category_id=self.category, treatment="Revenue", pattern="BIG DEPOSIT")
+            other = db.insert_transaction(c, business_id=self.business, account_id=self.account, transaction_date="2026-02-03",
+                posting_date=None, description="SHOP", source_amount=-40, signed_amount=-40)[0]
+            db.classify_transaction(c, other, category_id=self.category, treatment="Expense", pattern="SHOP")
+            db.split_transaction(c, business_id=self.business, transaction_id=tid, lines=[
+                {"amount": 600, "category_id": self.category, "treatment": "Revenue"},
+                {"amount": 400, "category_id": self.category, "treatment": "Revenue", "notes": "second"}])
+            c.execute("INSERT INTO mileage_log(business_id, trip_date, miles, created_at) VALUES (?, '2026-02-02', 12.5, 'x')", (self.business,))
+            rival = db.get_or_create_business(c, "Rival Co")
+            rival_account = db.get_or_create_account(c, rival, "Checking", "checking")
+            db.insert_transaction(c, business_id=rival, account_id=rival_account, transaction_date="2026-02-01",
+                posting_date=None, description="RIVAL ONLY", source_amount=-5, signed_amount=-5)
+            plain = bundle.export_bundle(c, self.business, exported_by="me")
+            locked = bundle.export_bundle(c, self.business, password="open sesame")
+            self.assertTrue(bundle.is_encrypted(locked) and not bundle.is_encrypted(plain))
+            self.assertNotIn(b"BIG DEPOSIT", locked)
+            before = c.execute("SELECT COUNT(*), ROUND(SUM(signed_amount), 2) FROM transactions WHERE business_id = ?",
+                               (self.business,)).fetchone()
+        other_path = Path(self.temp.name) / "other.db"
+        db.init_db(other_path)
+        with db.connect(other_path) as o:
+            db.get_or_create_business(o, "Dummy First")
+            with self.assertRaises(bundle.NeedPassword):
+                bundle.preview(o, locked)
+            with self.assertRaises(ValueError):
+                bundle.preview(o, locked, "wrong")
+            info = bundle.preview(o, locked, "open sesame")
+            self.assertFalse(info["exists"])
+            self.assertEqual(info["counts"]["transactions"], before[0])
+            result = bundle.apply(o, locked, "open sesame")
+            new_id = result["business_id"]
+            after = o.execute("SELECT COUNT(*), ROUND(SUM(signed_amount), 2) FROM transactions WHERE business_id = ?", (new_id,)).fetchone()
+            self.assertEqual(tuple(after), tuple(before))
+            self.assertEqual(o.execute("SELECT COUNT(*) FROM transactions WHERE split_parent_id IS NOT NULL AND business_id = ?", (new_id,)).fetchone()[0], 2)
+            self.assertEqual(o.execute("SELECT COUNT(*) FROM mileage_log WHERE business_id = ?", (new_id,)).fetchone()[0], 1)
+            self.assertEqual(o.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(o.execute("SELECT COUNT(*) FROM transactions WHERE description = 'RIVAL ONLY'").fetchone()[0], 0)
+            # a change made here after export is flagged, and re-importing replaces it
+            o.execute("UPDATE transactions SET updated_at = '2999-01-01' WHERE business_id = ?", (new_id,))
+            self.assertTrue(bundle.preview(o, plain)["newer_here"])
+            o.execute("DELETE FROM transactions WHERE business_id = ? AND description = 'SHOP'", (new_id,))
+            again = bundle.apply(o, plain)
+            self.assertTrue(again["replaced"] and again["business_id"] == new_id)
+            self.assertEqual(o.execute("SELECT COUNT(*) FROM transactions WHERE business_id = ?", (new_id,)).fetchone()[0], before[0])
+            self.assertEqual(o.execute("SELECT COUNT(*) FROM businesses").fetchone()[0], 2)
+        with self.assertRaises(ValueError):
+            with db.connect(other_path) as o:
+                bundle.preview(o, b"not a bundle")
 
     def test_summary_and_mileage(self):
         from books import mileage, summary

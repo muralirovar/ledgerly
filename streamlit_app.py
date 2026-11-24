@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 from html import escape
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import base64
 import hmac
@@ -11,7 +12,7 @@ import hmac
 import pandas as pd
 import streamlit as st
 
-from books import ai_config, ask as ask_mod, backup, loc as loc_mod, mileage as mileage_mod, summary as summary_mod, db, documents, exporter, importers, statements
+from books import access, ai_config, auth, auth_ui, bundle, ask as ask_mod, backup, loc as loc_mod, mileage as mileage_mod, summary as summary_mod, db, documents, exporter, importers, statements
 from books import staff as staff_mod
 
 
@@ -612,8 +613,16 @@ def render_personal_tax_prep() -> None:
                 st.error("That item could not be found.")
 
 
+CURRENT_USER = auth_ui.gate(DB_PATH)
+LOGIN_ON = CURRENT_USER["enabled"]
+USER_NAME = CURRENT_USER["username"]
+USER_IS_OWNER = CURRENT_USER["is_owner"]
+ALLOWED_IDS: list[int] | None = CURRENT_USER["ids"]
+
 with db.connect(DB_PATH) as connection:
     businesses = db.list_businesses(connection)
+if ALLOWED_IDS is not None:
+    businesses = [b for b in businesses if int(b["id"]) in ALLOWED_IDS]
 
 st.sidebar.button("Ledgerly · Business books", key="brand_home", help="Go to the dashboard",
                   on_click=go_to, args=("▦  Dashboard",), type="tertiary")
@@ -636,8 +645,11 @@ nav = {
     "▥  Reports": "Reports", "▤  Summary sheet": "Summary Sheet", "⌕  Ask your books": "Ask Your Books", "☻  Staff & payroll": "Staff & Payroll", "☷  Parties": "Parties", "⌁  Categories & rules": "Categories & Rules",
     "◇  Accounts & credit": "Accounts & Credit",
     "⚙  Manage business": "Manage Business", "↓  Export & settings": "Export & Settings",
-    "🛡  Admin & backup": "Admin & Backup",
+    "🛡  Admin & backup": "Admin & Backup", "☰  Users & access": "Users & Access", "⌕  Access audit": "Access Audit", "◉  My account": "My Account", "⇄  Share a business": "Share Business",
 }
+OWNER_ONLY = ("⚙  Manage business", "🛡  Admin & backup", "☰  Users & access", "⌕  Access audit", "⇄  Share a business")
+if not USER_IS_OWNER:
+    nav = {label: name for label, name in nav.items() if label not in OWNER_ONLY}
 if st.session_state.get("nav_choice") not in nav:
     st.session_state["nav_choice"] = "▦  Dashboard"
 NAV_GROUPS = {
@@ -646,8 +658,10 @@ NAV_GROUPS = {
                     "≡  All transactions"],
     "People & payroll": ["☻  Staff & payroll", "☷  Parties", "⌁  Categories & rules"],
     "Tax": ["▣  Tax prep", "♙  Personal tax prep", "▦  1099 vendors", "⛟  Tax & business miles"],
-    "Setup": ["◇  Accounts & credit", "⚙  Manage business", "↓  Export & settings", "🛡  Admin & backup"],
+    "Setup": ["◇  Accounts & credit", "⚙  Manage business", "↓  Export & settings", "🛡  Admin & backup", "☰  Users & access", "⌕  Access audit", "⇄  Share a business", "◉  My account"],
 }
+NAV_GROUPS = {group: [item for item in items if item in nav] for group, items in NAV_GROUPS.items()}
+NAV_GROUPS = {group: items for group, items in NAV_GROUPS.items() if items}
 nav_choice = st.session_state["nav_choice"]
 
 def pick_nav(group_name: str) -> None:
@@ -661,6 +675,13 @@ for group_name, group_items in NAV_GROUPS.items():
                  format_func=lambda label: label.split("  ", 1)[-1],
                  on_change=pick_nav, args=(group_name,), label_visibility="collapsed")
 page = nav[nav_choice]
+if LOGIN_ON:
+    st.sidebar.caption(f"Signed in as {CURRENT_USER['display']}" + (" · owner" if USER_IS_OWNER else ""))
+    st.sidebar.button("Sign out", key="sign_out", on_click=auth_ui.sign_out, args=(DB_PATH,))
+    if businesses and st.session_state.get("audit_last") != (page, business_id):
+        st.session_state["audit_last"] = (page, business_id)
+        with db.connect(DB_PATH) as connection:
+            access.log(connection, USER_NAME, "view", business=business_name, page=page)
 if True:
     with st.popover("💬", key="ask_fab", help="Ask your books", width="content"):
         st.markdown("**Ask your books**  \n<span style='font-size:.8rem;color:#6b7785'>Try: makesh payments 2026 · checks over 5000 · revenue sept by month</span>",
@@ -673,7 +694,7 @@ if True:
         if asked and typed.strip():
             with db.connect(DB_PATH) as connection:
                 parsed_q = ask_mod.parse(typed, [c["name"] for c in db.list_categories(connection, business_id)], [])
-                found_q = ask_mod.run(connection, parsed_q, business_id)
+                found_q = ask_mod.run(connection, parsed_q, business_id, allowed_ids=ALLOWED_IDS)
             chat.append({"q": typed.strip(), "found": found_q, "parsed": parsed_q})
             del chat[:-6]
         for entry in reversed(chat):
@@ -963,6 +984,8 @@ if page == "Dashboard":
     all_businesses = st.toggle("Show combined portfolio", value=False)
     with db.connect(DB_PATH) as connection:
         summary = db.dashboard(connection, None if all_businesses else business_id)
+    if ALLOWED_IDS is not None:
+        summary = [row for row in summary if int(row["business_id"]) in ALLOWED_IDS]
     total_revenue = sum(float(row["revenue"]) for row in summary)
     total_expense = sum(float(row["expense"]) for row in summary)
     total_review = sum(int(row["needs_review"] or 0) for row in summary)
@@ -3479,7 +3502,7 @@ elif page == "Ask Your Books":
         with db.connect(DB_PATH) as connection:
             category_names = [item["name"] for item in db.list_categories(connection, business_id)]
             parsed = ask_mod.parse(ask_text, category_names, [])
-            found = ask_mod.run(connection, parsed, business_id)
+            found = ask_mod.run(connection, parsed, business_id, allowed_ids=ALLOWED_IDS)
         st.markdown("**Understood as:** " + "  ·  ".join(f"`{part}`" for part in ask_mod.describe(parsed))
                     if ask_mod.describe(parsed) else "**Understood as:** everything")
         summary_totals = ask_mod.totals(found)
@@ -3574,6 +3597,262 @@ elif page == "1099 Vendors":
                    "shown separately because the card processor reports them (1099-K). Taxpayer ID and address are not "
                    "stored here; collect a W-9 from each vendor.")
         csv_download("Download 1099 vendor list (CSV)", frame_1099, f"1099-vendors-{int(year_1099)}", "dl_1099")
+
+
+elif page == "Users & Access":
+    page_header("Users and access", "Add people, choose which businesses each can open, and reset a password or authenticator.",
+                "Users & access")
+    if not LOGIN_ON:
+        st.warning("Sign-in is switched off (BOOKS_AUTH=off), so nothing here is enforced.")
+    with db.connect(DB_PATH) as connection:
+        all_businesses_list = db.list_businesses(connection)
+        accounts_list = auth.list_accounts(connection)
+        business_text = access.businesses_text(connection)
+    names_by_id = {int(b["id"]): b["name"] for b in all_businesses_list}
+    if accounts_list:
+        st.dataframe(pd.DataFrame([{
+            "Username": a["username"], "Name": a["display_name"], "Role": "Owner" if a["is_owner"] else "Editor",
+            "Businesses": "All" if a["is_owner"] else business_text.get(a["username"], "None"),
+            "Authenticator": "On" if a["mfa_enabled"] else "Not set up", "Active": "Yes" if a["active"] else "Off",
+            "Last sign-in": a["last_login"] or ""} for a in accounts_list]), hide_index=True, width="stretch")
+    section_label("Add a person")
+    temp_default = st.session_state.setdefault("new_user_temp", secrets.token_urlsafe(12))
+    with st.form("add_person", clear_on_submit=False):
+        n1, n2, n3 = st.columns([1, 1, 1.4])
+        new_username = n1.text_input("Username")
+        new_name = n2.text_input("Name")
+        new_password = n3.text_input("Temporary password", value=temp_default,
+                                     help="They must choose their own password and set up an authenticator at first sign-in.")
+        m1, m2 = st.columns([3, 1])
+        new_businesses = m1.multiselect("Businesses they can open", list(names_by_id.values()))
+        new_owner = m2.checkbox("Owner", help="Owners open every business and these admin pages.")
+        if st.form_submit_button("Add person", type="primary"):
+            try:
+                with db.connect(DB_PATH) as connection:
+                    auth.create_user(connection, new_username, new_password, display_name=new_name,
+                                     is_owner=new_owner, must_change=True)
+                    access.grant(connection, new_username, [i for i, n in names_by_id.items() if n in new_businesses])
+                    access.log(connection, USER_NAME, "user added", f"{new_username.strip().lower()}: "
+                               f"{'owner' if new_owner else ', '.join(new_businesses) or 'no businesses'}")
+                st.session_state["new_user_shown"] = (new_username.strip().lower(), new_password)
+                st.session_state.pop("new_user_temp", None)
+                rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+    if st.session_state.get("new_user_shown"):
+        shown_user, shown_password = st.session_state.pop("new_user_shown")
+        st.success(f"Added {shown_user}. Give them this temporary password once; it is not shown again.")
+        st.code(shown_password, language=None)
+    if accounts_list:
+        section_label("Change a person")
+        who = st.selectbox("Person", [a["username"] for a in accounts_list], key="manage_user")
+        target = next(a for a in accounts_list if a["username"] == who)
+        is_self = who == USER_NAME
+        if not target["is_owner"]:
+            with db.connect(DB_PATH) as connection:
+                current_ids = access.business_ids_for(connection, who)
+            picked = st.multiselect("Businesses", list(names_by_id.values()),
+                                    default=[names_by_id[i] for i in current_ids if i in names_by_id],
+                                    key=f"manage_businesses_{who}")
+            if st.button("Save businesses", key=f"save_businesses_{who}"):
+                with db.connect(DB_PATH) as connection:
+                    access.grant(connection, who, [i for i, n in names_by_id.items() if n in picked])
+                    access.log(connection, USER_NAME, "access changed", f"{who}: {', '.join(picked) or 'none'}")
+                st.success("Saved.")
+                rerun()
+        c1, c2, c3, c4 = st.columns(4)
+        if c1.button("Reset password", key=f"reset_pw_{who}", disabled=is_self, width="stretch",
+                     help="Sets a temporary password. They choose a new one at next sign-in."):
+            temp = secrets.token_urlsafe(12)
+            with db.connect(DB_PATH) as connection:
+                auth.set_password(connection, who, temp, must_change=True)
+                access.log(connection, USER_NAME, "password reset", who)
+            st.session_state["new_user_shown"] = (who, temp)
+            rerun()
+        if c2.button("Reset authenticator", key=f"reset_mfa_{who}", disabled=is_self, width="stretch",
+                     help="They scan a new QR code at next sign-in."):
+            with db.connect(DB_PATH) as connection:
+                auth.reset_mfa(connection, who)
+                access.log(connection, USER_NAME, "mfa reset", who)
+            st.success(f"{who} will set up the authenticator again at next sign-in.")
+        if c3.button("Turn on" if not target["active"] else "Turn off", key=f"toggle_{who}", disabled=is_self, width="stretch"):
+            with db.connect(DB_PATH) as connection:
+                auth.set_active(connection, who, not target["active"])
+                access.log(connection, USER_NAME, "user turned off" if target["active"] else "user turned on", who)
+            rerun()
+        sure = c4.checkbox("Confirm delete", key=f"del_sure_{who}", disabled=is_self)
+        if c4.button("Delete", key=f"delete_{who}", disabled=is_self or not sure, width="stretch"):
+            try:
+                with db.connect(DB_PATH) as connection:
+                    auth.delete_user(connection, who)
+                    access.revoke(connection, who)
+                    access.log(connection, USER_NAME, "user deleted", who)
+                rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+        if is_self:
+            st.caption("You cannot reset, turn off or delete your own account here. Use My account to change your password.")
+        if target["locked_until"]:
+            st.caption(f"Locked until {target['locked_until']} after too many wrong attempts.")
+
+
+elif page == "My Account":
+    page_header("My account", "Change your password or get new recovery codes.", "My account")
+    if not LOGIN_ON:
+        st.info("Sign-in is switched off (BOOKS_AUTH=off), so there is no account to manage.")
+        st.stop()
+    with db.connect(DB_PATH) as connection:
+        left_codes = auth.recovery_codes_left(connection, USER_NAME)
+    st.write(f"Signed in as **{CURRENT_USER['display']}** ({USER_NAME}). Recovery codes left: **{left_codes}**.")
+    section_label("Change password")
+    with st.form("change_password", clear_on_submit=True):
+        old_password = st.text_input("Current password", type="password")
+        new_password = st.text_input("New password", type="password")
+        repeat_password = st.text_input("Repeat the new password", type="password")
+        if st.form_submit_button("Change password", type="primary"):
+            with db.connect(DB_PATH) as connection:
+                user_row = auth.get_user(connection, USER_NAME)
+                if not auth.verify_password(old_password, user_row["password_hash"]):
+                    st.error("The current password is not right.")
+                elif new_password != repeat_password:
+                    st.error("The two new passwords do not match.")
+                else:
+                    try:
+                        auth.set_password(connection, USER_NAME, new_password)
+                        access.log(connection, USER_NAME, "password changed")
+                        st.success("Password changed.")
+                    except ValueError as exc:
+                        st.error(str(exc))
+    section_label("Recovery codes")
+    st.caption("Making new codes cancels the old ones. Save the new ones; they are shown only once.")
+    with st.form("new_codes", clear_on_submit=True):
+        confirm_password = st.text_input("Password", type="password", key="codes_password")
+        if st.form_submit_button("Make new recovery codes"):
+            with db.connect(DB_PATH) as connection:
+                user_row = auth.get_user(connection, USER_NAME)
+                if not auth.verify_password(confirm_password, user_row["password_hash"]):
+                    st.error("The password is not right.")
+                else:
+                    st.session_state["my_codes"] = auth.new_recovery_codes(connection, USER_NAME)
+                    access.log(connection, USER_NAME, "recovery codes renewed")
+    if st.session_state.get("my_codes"):
+        st.code("\n".join(st.session_state.pop("my_codes")), language=None)
+        st.warning("Save these codes now.")
+
+
+elif page == "Access Audit":
+    page_header("Access audit", "Who signed in, which business and page they opened, failed attempts, and who changed access.",
+                "Access audit")
+    if not LOGIN_ON:
+        st.warning("Sign-in is switched off (BOOKS_AUTH=off), so nothing is recorded.")
+    with db.connect(DB_PATH) as connection:
+        people = access.user_summary(connection)
+    section_label("By person")
+    if people:
+        st.dataframe(pd.DataFrame(people).rename(columns={
+            "username": "Username", "sign_ins": "Sign-ins", "failures": "Failed / locked", "last_sign_in": "Last sign-in",
+            "last_activity": "Last activity", "page_views": "Page views", "businesses_opened": "Businesses opened"}),
+            hide_index=True, width="stretch")
+    else:
+        st.info("No activity recorded yet.")
+    section_label("Every event")
+    f1, f2, f3, f4, f5 = st.columns([2, 1.5, 2, 1.2, 1.2])
+    who = f1.selectbox("Person", ["All"] + [p["username"] for p in people], key="audit_who")
+    what = f2.selectbox("Event", ["All", "sign in", "sign out", "failed sign in", "locked", "view", "password changed",
+                                  "mfa enabled", "mfa reset", "password reset", "user added", "user deleted",
+                                  "access changed", "recovery codes renewed"], key="audit_event")
+    biz = f3.selectbox("Business", ["All"] + [b["name"] for b in businesses], key="audit_biz")
+    a_from = f4.date_input("From", value=date.today() - timedelta(days=30), key="audit_from")
+    a_to = f5.date_input("To", value=date.today(), key="audit_to")
+    with db.connect(DB_PATH) as connection:
+        events = access.audit(connection, username="" if who == "All" else who, event="" if what == "All" else what,
+                              business="" if biz == "All" else biz, since=a_from.isoformat(), until=a_to.isoformat())
+    audit_frame = pd.DataFrame(events).rename(columns={"created_at": "When (UTC)", "username": "Username", "event": "Event",
+                                                       "business": "Business", "page": "Page", "detail": "Detail"})
+    st.caption(f"{len(audit_frame):,} events")
+    if len(audit_frame):
+        st.dataframe(audit_frame, hide_index=True, width="stretch", height=520)
+        csv_download("Download audit log (CSV)", audit_frame, "access-audit", "dl_access_audit")
+    st.caption("Recorded: sign-ins, sign-outs, wrong passwords or codes, lockouts, each business and page a person opens, "
+               "and every change to people and access. Changes to individual transactions are not tracked per person yet.")
+
+
+elif page == "Share Business":
+    page_header("Share a business", "Send one business to another copy of Ledgerly as a single file, or bring one in.",
+                "Share a business")
+    st.caption("A business file holds everything for one business: accounts, transactions, splits, rules, checks, loans, staff and "
+               "mileage. Importing **replaces** that business on this computer and leaves your other businesses alone. "
+               "Only one person should edit a given business between exports.")
+    tab_out, tab_in = st.tabs(["Export a business", "Import a business"])
+    with tab_out:
+        with db.connect(DB_PATH) as connection:
+            exportable = db.list_businesses(connection)
+        picks = st.multiselect("Businesses to export", [b["name"] for b in exportable], key="bundle_pick")
+        pw1 = st.text_input("Password for the file (recommended)", type="password", key="bundle_pw",
+                            help="The file is encrypted with this password. Send the password by a different route than the file.")
+        if st.button("Prepare files", type="primary", disabled=not picks, key="bundle_prepare"):
+            files = {}
+            with db.connect(DB_PATH) as connection:
+                for item in exportable:
+                    if item["name"] in picks:
+                        files[bundle.file_name(connection, int(item["id"]))] = (
+                            item["name"], bundle.export_bundle(connection, int(item["id"]), exported_by=USER_NAME, password=pw1))
+                        access.log(connection, USER_NAME, "business exported", item["name"] + (" (encrypted)" if pw1 else " (not encrypted)"))
+            st.session_state["bundle_files"] = files
+        for fname, (bname, payload) in st.session_state.get("bundle_files", {}).items():
+            st.download_button(f"⤓  {bname} · {fname} ({len(payload) / 1024:,.0f} KB)", data=payload, file_name=fname,
+                               mime="application/octet-stream", key=f"dl_bundle_{fname}")
+        if st.session_state.get("bundle_files") and not pw1:
+            st.warning("These files are not password protected. Anyone who gets a file can read the whole business.")
+    with tab_in:
+        upload = st.file_uploader("Choose a .ledgerly file", type=["ledgerly"], key=f"bundle_upload_{st.session_state.get('bundle_round', 0)}")
+        if upload:
+            raw = upload.getvalue()
+            pw2 = ""
+            if bundle.is_encrypted(raw):
+                pw2 = st.text_input("Password for this file", type="password", key="bundle_in_pw")
+            try:
+                if bundle.is_encrypted(raw) and not pw2:
+                    st.info("This file is password protected. Enter the password to continue.")
+                    info = None
+                else:
+                    with db.connect(DB_PATH) as connection:
+                        info = bundle.preview(connection, raw, pw2)
+            except (ValueError, bundle.NeedPassword) as exc:
+                st.error(str(exc))
+                info = None
+            if info:
+                labels = {"accounts": "Accounts", "transactions": "Transactions", "categories": "Categories", "rules": "Rules",
+                          "check_register": "Checks", "staff": "Staff", "mileage_log": "Mileage trips",
+                          "loan_events": "Loan events", "transaction_attachments": "Attachments"}
+                st.markdown(f"**{info['name']}** · exported {info['exported_at'][:16].replace('T', ' ')} UTC"
+                            + (f" by {info['exported_by']}" if info["exported_by"] else ""))
+                st.dataframe(pd.DataFrame([{"What": labels[k], "In the file": info["counts"].get(k, 0),
+                                            "On this computer now": info["current"].get(k, "—")} for k in labels]),
+                             hide_index=True, width="stretch")
+                if info["exists"]:
+                    st.warning(f"This will **replace** {info['name']} on this computer with the contents of the file.")
+                    if info["newer_here"]:
+                        st.error(f"This computer has changes to {info['name']} made after the file was exported "
+                                 f"(latest {info['latest_here'][:16].replace('T', ' ')} UTC). Importing will lose those changes.")
+                else:
+                    st.info(f"{info['name']} is not on this computer yet. Importing will add it.")
+                sure = st.checkbox("I understand and want to continue", key="bundle_sure")
+                if st.button("Import", type="primary", disabled=not sure, key="bundle_go"):
+                    backup_path = backup.create_backup(DB_PATH, "before-import")
+                    with db.connect(DB_PATH) as connection:
+                        outcome = bundle.apply(connection, raw, pw2)
+                        access.log(connection, USER_NAME, "business imported",
+                                   f"{outcome['name']} ({'replaced' if outcome['replaced'] else 'added'}), "
+                                   f"{outcome['added']['transactions']} transactions")
+                    st.session_state["bundle_round"] = st.session_state.get("bundle_round", 0) + 1
+                    st.session_state["bundle_done"] = (f"{outcome['name']} {'replaced' if outcome['replaced'] else 'added'}: "
+                                                       f"{outcome['added']['transactions']:,} transactions. A backup was saved first "
+                                                       f"({backup_path.name}).")
+                    rerun()
+        if st.session_state.get("bundle_done"):
+            st.success(st.session_state.pop("bundle_done"))
+            st.caption("If the business is new here, give people access to it on Users & access.")
 
 
 elif page == "Mileage":

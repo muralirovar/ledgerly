@@ -4,3 +4,5 @@ openpyxl>=3.1,<4
 xlsxwriter>=3.2,<4
 pypdf>=6,<7
 Pillow>=11,<14
+segno>=1.6,<2
+cryptography>=42,<51

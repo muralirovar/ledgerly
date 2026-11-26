@@ -1077,6 +1077,62 @@ class BooksTests(unittest.TestCase):
             with db.connect(other_path) as o:
                 bundle.preview(o, b"not a bundle")
 
+    def test_flip_direction(self):
+        with db.connect(self.path) as c:
+            rows = importers.preview_csv("Date,Description,Amount\n1/2/26,SHOP,50\n", "checking")
+            importers.commit_rows(c, business_id=self.business, account_id=self.account, account_type="checking",
+                                  rows=rows, source_name="f.csv")
+            tid = c.execute("SELECT id FROM transactions").fetchone()[0]
+            c.execute("UPDATE transactions SET treatment = 'Revenue', status = 'confirmed' WHERE id = ?", (tid,))
+            db.flip_direction(c, business_id=self.business, transaction_id=tid)
+            row = c.execute("SELECT signed_amount, source_amount, treatment FROM transactions WHERE id = ?", (tid,)).fetchone()
+            self.assertEqual((row[0], row[1], row[2]), (-50.0, -50.0, "Needs review"))
+            db.flip_direction(c, business_id=self.business, transaction_id=tid)
+            self.assertEqual(c.execute("SELECT signed_amount FROM transactions").fetchone()[0], 50.0)
+
+    def test_move_account(self):
+        with db.connect(self.path) as c:
+            card = db.get_or_create_account(c, self.business, "Card A", "credit_card")
+            card2 = db.get_or_create_account(c, self.business, "Card B", "credit_card")
+            bank2 = db.get_or_create_account(c, self.business, "Savings", "checking")
+            other_biz = db.get_or_create_business(c, "Elsewhere")
+            foreign = db.get_or_create_account(c, other_biz, "Theirs", "checking")
+            # a card statement row imported into checking by mistake: raw +50 charge, read as money in
+            rows = importers.preview_csv("Date,Description,Amount\n1/2/26,SHOP,50\n1/3/26,STORE,20\n", "checking")
+            result = importers.commit_rows(c, business_id=self.business, account_id=self.account, account_type="checking",
+                                           rows=rows, source_name="wrong.csv")
+            ids = [r["id"] for r in c.execute("SELECT id FROM transactions ORDER BY id")]
+            c.execute("UPDATE transactions SET treatment = 'Expense', status = 'confirmed' WHERE id = ?", (ids[0],))
+            keep = db.plan_account_move(c, ids[0], card)
+            self.assertEqual((keep["flips"], keep["new_signed"], keep["new_source"]), (False, 50.0, -50.0))
+            plan = db.plan_account_move(c, ids[0], card, reverse=True)
+            self.assertTrue(plan["flips"])
+            self.assertEqual((plan["old_signed"], plan["new_signed"]), (50.0, -50.0))
+            with self.assertRaises(ValueError):
+                db.plan_account_move(c, ids[0], self.account)
+            with self.assertRaises(ValueError):
+                db.plan_account_move(c, ids[0], foreign)
+            moved = db.move_batch_account(c, business_id=self.business, batch_id=result["batch_id"], new_account_id=card, reverse=True)
+            self.assertEqual((moved["moved"], moved["reset_to_review"]), (2, 2))
+            got = [dict(r) for r in c.execute("SELECT account_id, signed_amount, source_amount, treatment FROM transactions ORDER BY id")]
+            self.assertEqual([g["account_id"] for g in got], [card, card])
+            self.assertEqual([g["signed_amount"] for g in got], [-50.0, -20.0])
+            self.assertEqual([g["source_amount"] for g in got], [50.0, 20.0])
+            self.assertEqual(got[0]["treatment"], "Needs review")
+            self.assertEqual(c.execute("SELECT account_id FROM import_batches WHERE id = ?", (result["batch_id"],)).fetchone()[0], card)
+            # card to card keeps the direction; a re-import of the same row into the original account is not blocked
+            same = db.plan_account_move(c, ids[0], card2)
+            self.assertFalse(same["flips"])
+            db.move_transaction_account(c, business_id=self.business, transaction_id=ids[0], new_account_id=card2)
+            self.assertEqual(c.execute("SELECT account_id, signed_amount, import_batch_id FROM transactions WHERE id = ?", (ids[0],)).fetchone()[:2], (card2, -50.0))
+            # moving back to a bank account flips it again, and a row already there blocks the move
+            back = db.plan_account_move(c, ids[0], bank2, reverse=True)
+            self.assertEqual(back["new_signed"], 50.0)
+            dup = db.insert_transaction(c, business_id=self.business, account_id=bank2, transaction_date="2026-01-02",
+                posting_date=None, description="SHOP", source_amount=50.0, signed_amount=50.0, source_reference="1")
+            with self.assertRaises(ValueError):
+                db.move_transaction_account(c, business_id=self.business, transaction_id=ids[0], new_account_id=bank2, reverse=True)
+
     def test_summary_and_mileage(self):
         from books import mileage, summary
         with db.connect(self.path) as connection:

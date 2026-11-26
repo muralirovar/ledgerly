@@ -814,6 +814,126 @@ def finish_import_batch(
     )
 
 
+def _is_card(account_type: str) -> bool:
+    return account_type == "credit_card"
+
+
+def plan_account_move(connection: sqlite3.Connection, transaction_id: int, new_account_id: int,
+                      reverse: bool = False) -> dict[str, Any]:
+    """What moving one transaction to another account of the same business would do.
+
+    By default the direction (money in or out) is kept and only the raw statement amount is rewritten to the new
+    account's convention (card files list charges as positive). ``reverse=True`` is for a card statement that was
+    imported into a bank account (or the other way round): the direction is reversed, and because an expense that
+    became money in is no longer an expense, the category and treatment are reset to Needs review.
+    """
+    txn = connection.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,)).fetchone()
+    if txn is None:
+        raise ValueError("Transaction not found.")
+    if txn["status"] == "split" or txn["split_parent_id"]:
+        raise ValueError("This transaction is part of a split. Revert the split first, move it, then split it again.")
+    old = connection.execute("SELECT * FROM accounts WHERE id = ?", (txn["account_id"],)).fetchone()
+    new = connection.execute("SELECT * FROM accounts WHERE id = ?", (new_account_id,)).fetchone()
+    if new is None or int(new["business_id"]) != int(txn["business_id"]):
+        raise ValueError("Choose an account of the same business.")
+    if int(new["id"]) == int(txn["account_id"]):
+        raise ValueError("It is already in that account.")
+    if connection.execute("SELECT 1 FROM check_register WHERE transaction_id = ?", (transaction_id,)).fetchone():
+        raise ValueError("This transaction is tied to a check in the register. Unlink or move the check first.")
+    old_signed = float(txn["signed_amount"])
+    new_signed = -old_signed if reverse else old_signed
+    new_source = -new_signed if _is_card(new["account_type"]) else new_signed
+    return {"transaction_id": int(transaction_id), "business_id": int(txn["business_id"]), "from_account": old["name"],
+            "to_account": new["name"], "new_account_id": int(new["id"]), "old_signed": old_signed,
+            "new_signed": round(new_signed, 2), "new_source": new_source, "flips": bool(reverse and old_signed != 0),
+            "description": txn["description"], "transaction_date": txn["transaction_date"],
+            "source_reference": txn["source_reference"]}
+
+
+def _apply_move(connection: sqlite3.Connection, plan: dict[str, Any], *, detach_batch: bool) -> None:
+    fingerprint = transaction_fingerprint(plan["business_id"], plan["new_account_id"], plan["transaction_date"],
+                                          plan["new_source"], plan["description"], plan["source_reference"])
+    clash = connection.execute("SELECT id FROM transactions WHERE fingerprint = ? AND id <> ?",
+                               (fingerprint, plan["transaction_id"])).fetchone()
+    if clash:
+        raise ValueError(f"A matching transaction (#{clash['id']}) already exists in {plan['to_account']}. "
+                         "Delete one of the two instead of moving.")
+    now = utc_now()
+    connection.execute(
+        """UPDATE transactions SET account_id = ?, source_amount = ?, signed_amount = ?, fingerprint = ?,
+               related_account_id = CASE WHEN related_account_id = ? THEN NULL ELSE related_account_id END,
+               import_batch_id = CASE WHEN ? THEN NULL ELSE import_batch_id END, updated_at = ?
+           WHERE id = ?""",
+        (plan["new_account_id"], plan["new_source"], plan["new_signed"], fingerprint, plan["new_account_id"],
+         int(detach_batch), now, plan["transaction_id"]))
+    if plan["flips"]:
+        connection.execute(
+            """UPDATE transactions SET treatment = 'Needs review', status = 'needs_review', category_id = NULL,
+                   learned_rule_id = NULL, reviewed_at = NULL WHERE id = ?""", (plan["transaction_id"],))
+
+
+def move_transaction_account(connection: sqlite3.Connection, *, business_id: int, transaction_id: int,
+                             new_account_id: int, reverse: bool = False) -> dict[str, Any]:
+    plan = plan_account_move(connection, transaction_id, new_account_id, reverse)
+    if plan["business_id"] != int(business_id):
+        raise ValueError("Transaction not found.")
+    _apply_move(connection, plan, detach_batch=True)
+    return plan
+
+
+def flip_direction(connection: sqlite3.Connection, *, business_id: int, transaction_id: int) -> dict[str, Any]:
+    """Turn a debit into a credit or the other way round, in the same account.
+
+    The amount changes sign, and because an expense that becomes money in is no longer an expense, the category and
+    treatment are reset to Needs review.
+    """
+    txn = connection.execute("SELECT * FROM transactions WHERE id = ? AND business_id = ?",
+                             (transaction_id, business_id)).fetchone()
+    if txn is None:
+        raise ValueError("Transaction not found.")
+    if txn["status"] == "split" or txn["split_parent_id"]:
+        raise ValueError("This transaction is part of a split. Revert the split first, flip it, then split it again.")
+    if connection.execute("SELECT 1 FROM check_register WHERE transaction_id = ?", (transaction_id,)).fetchone():
+        raise ValueError("This transaction is tied to a check in the register. Unlink the check first.")
+    new_source = -float(txn["source_amount"])
+    new_signed = -float(txn["signed_amount"])
+    fingerprint = transaction_fingerprint(business_id, txn["account_id"], txn["transaction_date"], new_source,
+                                          txn["description"], txn["source_reference"])
+    clash = connection.execute("SELECT id FROM transactions WHERE fingerprint = ? AND id <> ?",
+                               (fingerprint, transaction_id)).fetchone()
+    if clash:
+        raise ValueError(f"A matching transaction (#{clash['id']}) already exists. Delete one of the two instead.")
+    connection.execute(
+        """UPDATE transactions SET source_amount = ?, signed_amount = ?, fingerprint = ?, treatment = 'Needs review',
+               status = 'needs_review', category_id = NULL, learned_rule_id = NULL, reviewed_at = NULL,
+               related_account_id = NULL, updated_at = ? WHERE id = ?""",
+        (new_source, round(new_signed, 2), fingerprint, utc_now(), transaction_id))
+    return {"old_signed": float(txn["signed_amount"]), "new_signed": round(new_signed, 2)}
+
+
+def move_batch_account(connection: sqlite3.Connection, *, business_id: int, batch_id: int,
+                       new_account_id: int, reverse: bool = False) -> dict[str, Any]:
+    """Move every transaction of one import to another account (the usual fix for picking the wrong account)."""
+    batch = connection.execute("SELECT * FROM import_batches WHERE id = ? AND business_id = ?",
+                               (batch_id, business_id)).fetchone()
+    if batch is None:
+        raise ValueError("Import not found.")
+    moved = flipped = 0
+    skipped: list[str] = []
+    for row in connection.execute("SELECT id FROM transactions WHERE import_batch_id = ? ORDER BY id", (batch_id,)).fetchall():
+        try:
+            plan = plan_account_move(connection, int(row["id"]), new_account_id, reverse)
+        except ValueError as exc:
+            if "already in that account" not in str(exc):
+                skipped.append(f"#{row['id']}: {exc}")
+            continue
+        _apply_move(connection, plan, detach_batch=False)
+        moved += 1
+        flipped += int(plan["flips"])
+    connection.execute("UPDATE import_batches SET account_id = ? WHERE id = ?", (new_account_id, batch_id))
+    return {"moved": moved, "reset_to_review": flipped, "skipped": skipped}
+
+
 def undo_import_batch(connection: sqlite3.Connection, batch_id: int) -> int:
     row = connection.execute(
         "SELECT COUNT(*) AS count FROM transactions WHERE import_batch_id = ?", (batch_id,)

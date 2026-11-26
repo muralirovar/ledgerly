@@ -132,6 +132,11 @@ st.markdown("""
   .page-title {font-family: "Barlow Condensed", Barlow, sans-serif; font-weight:700; font-size:2.35rem; line-height:1.08; color:var(--ink); letter-spacing:-.035em; margin:0;}
   .page-sub {color:var(--muted); font-size:.98rem; margin-top:.55rem; max-width:760px; line-height:1.55;}
   .metric-card {background:var(--paper); border:1px solid var(--line); border-radius:16px; padding:1.15rem 1.2rem; min-height:132px; box-shadow:0 4px 18px rgba(19,37,61,.045); position:relative; overflow:hidden;}
+  [class*="st-key-drill_"] {position:relative;}
+  [class*="st-key-drill_"] .stElementContainer:has(.stButton) {position:static !important; height:0 !important; min-height:0 !important; margin:0; overflow:visible;}
+  [class*="st-key-drill_"] .stButton {position:static;}
+  [class*="st-key-drill_"] .stButton button {position:absolute; left:0; top:0; width:100%; height:100%; min-height:100%; opacity:0; cursor:pointer; z-index:3;}
+  [class*="st-key-drill_"]:hover .metric-card {border-color:#1778ba; box-shadow:0 6px 22px rgba(23,120,186,.18);}
   .metric-card:after {content:""; position:absolute; width:70px; height:70px; border-radius:50%; right:-25px; top:-27px; background:var(--tint);}
   .metric-icon {width:32px; height:32px; border-radius:9px; display:grid; place-items:center; background:var(--tint); color:var(--accent); font-weight:800; margin-bottom:.75rem;}
   .metric-label {font-size:.72rem; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; font-weight:720;}
@@ -185,18 +190,26 @@ def page_header(title: str, subtitle: str, eyebrow: str = "Workspace") -> None:
     )
 
 
-def metric_card(label: str, value: str, note: str, icon: str, tone: str = "teal") -> None:
+def metric_card(label: str, value: str, note: str, icon: str, tone: str = "teal", drill: str = "") -> bool:
+    """A summary card. With ``drill`` set the whole card is clickable and the call returns True when clicked."""
     colors = {
         "teal": ("#1778ba", "#e6f1f8"), "navy": ("#0d3a5c", "#e6edf3"),
         "gold": ("#c98a10", "#fff4d6"), "rose": ("#b84e60", "#fdeff1"),
     }
     accent, tint = colors[tone]
+    holder = st.container(key=f"drill_{drill}") if drill else st.container()
+    with holder:
+        return _metric_card_body(label, value, note, icon, accent, tint, bool(drill), drill)
+
+
+def _metric_card_body(label, value, note, icon, accent, tint, clickable, drill) -> bool:
     st.markdown(
         f'<div class="metric-card" style="--accent:{accent};--tint:{tint}">'
         f'<div class="metric-icon">{escape(icon)}</div><div class="metric-label">{escape(label)}</div>'
         f'<div class="metric-value">{escape(value)}</div><div class="metric-note">{escape(note)}</div></div>',
         unsafe_allow_html=True,
     )
+    return bool(clickable and st.button(label, key=f"{drill}_btn"))
 
 
 def section_label(text: str) -> None:
@@ -239,7 +252,8 @@ def csv_download(label: str, frame: pd.DataFrame, file_stem: str, key: str) -> N
                        file_name=f"{db.slugify(business_name)}-{file_stem}.csv", mime="text/csv", key=key)
 
 
-def render_loan_balances(loan_rows: list[dict], show_business: bool = False, equity: dict | None = None) -> None:
+def render_loan_balances(loan_rows: list[dict], show_business: bool = False, equity: dict | None = None,
+                         key_prefix: str = "loans") -> None:
     """Two plain lists: who owes the business money, and who the business owes."""
     owed_to_us = sorted((r for r in loan_rows if r["owed_to_us"] > 0.004), key=lambda r: -r["owed_to_us"])
     we_owe = sorted((r for r in loan_rows if r["we_owe"] > 0.004), key=lambda r: -r["we_owe"])
@@ -251,8 +265,10 @@ def render_loan_balances(loan_rows: list[dict], show_business: bool = False, equ
         if owed_to_us:
             frame = pd.DataFrame([{**({"Business": r["business"]} if show_business else {}),
                                    "Party": r["party"], "Amount": r["owed_to_us"]} for r in owed_to_us])
-            st.dataframe(frame, hide_index=True, width="stretch",
-                         column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            clicked = drill_table(frame, f"{key_prefix}_owed_to_us", column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            if clicked is not None:
+                open_transactions(search=str(clicked["Party"]), treatments=["Loan receivable", "Receivable repayment"],
+                                  business=str(clicked.get("Business", "")))
         else:
             st.caption("Nobody owes us anything.")
     with c2:
@@ -261,17 +277,24 @@ def render_loan_balances(loan_rows: list[dict], show_business: bool = False, equ
         if we_owe:
             frame = pd.DataFrame([{**({"Business": r["business"]} if show_business else {}),
                                    "Party": r["party"], "Amount": r["we_owe"]} for r in we_owe])
-            st.dataframe(frame, hide_index=True, width="stretch",
-                         column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            clicked = drill_table(frame, f"{key_prefix}_we_owe", column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            if clicked is not None:
+                open_transactions(search=str(clicked["Party"]), treatments=["Loan draw", "Principal repayment"],
+                                  business=str(clicked.get("Business", "")))
         else:
             st.caption("We owe nobody anything.")
         if equity and (equity["contributions"] or equity["draws"]):
             st.markdown("**Owner equity** (not counted as owed)")
-            st.dataframe(pd.DataFrame([
+            clicked = drill_table(pd.DataFrame([
                 {"Item": "Owner contributions (equity, not owed)", "Amount": equity["contributions"]},
                 {"Item": "Owner draws (taken out)", "Amount": equity["draws"]},
                 {"Item": "Net put in by owner", "Amount": round(equity["contributions"] - equity["draws"], 2)}]),
-                hide_index=True, width="stretch", column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+                f"{key_prefix}_equity", column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")})
+            if clicked is not None:
+                item = str(clicked["Item"])
+                open_transactions(treatments=["Owner contribution"] if item.startswith("Owner contrib")
+                                  else ["Owner draw"] if item.startswith("Owner draws")
+                                  else ["Owner contribution", "Owner draw"])
             st.caption("To make an owner contribution count as a debt, change its treatment to Loan draw.")
     if odd:
         with st.expander(f"{len(odd)} part(s) need a look: repayments larger than the loan on record"):
@@ -402,6 +425,41 @@ def go_to_ask_full() -> None:
 
 def go_to(label: str) -> None:
     st.session_state["nav_choice"] = label
+
+
+def open_transactions(*, search: str = "", categories: list[str] | None = None, treatments: list[str] | None = None,
+                      statuses: list[str] | None = None, business: str = "") -> None:
+    """Jump to the Transactions page with those filters set (all statuses unless given, so nothing is hidden)."""
+    st.session_state["txn_search"] = search
+    st.session_state["txn_cat_filter"] = categories or []
+    st.session_state["txn_treat_filter"] = treatments or []
+    st.session_state["txn_status_filter"] = statuses or []
+    if business:
+        st.session_state["pending_business"] = business
+    st.session_state["drill_from"] = st.session_state.get("nav_choice", "▦  Dashboard")
+    st.session_state["drill_gen"] = st.session_state.get("drill_gen", 0) + 1  # forget the clicked row
+    st.session_state["nav_choice"] = "≡  All transactions"
+    st.rerun()
+
+
+def go_back() -> None:
+    st.session_state["nav_choice"] = st.session_state.pop("drill_from", "▦  Dashboard")
+
+
+def clicked_position(event) -> int | None:
+    """Row number of the clicked cell or ticked row, else None."""
+    if event.selection.cells:
+        return int(event.selection.cells[0][0])
+    return int(event.selection.rows[0]) if event.selection.rows else None
+
+
+def drill_table(frame: pd.DataFrame, key: str, *, enabled: bool = True, **config):
+    """Show a table whose rows can be clicked. Returns the clicked row (a Series) or None."""
+    frame = frame.reset_index(drop=True)
+    event = st.dataframe(frame, hide_index=True, width="stretch", key=f"{key}_{st.session_state.get('drill_gen', 0)}",
+                         on_select="rerun" if enabled else None, selection_mode=["single-cell", "single-row"], **config)
+    position = clicked_position(event)
+    return frame.iloc[position] if enabled and position is not None else None
 
 
 def sync_category_treatment(category_key: str, treatment_key: str, defaults: dict[str, str]) -> None:
@@ -634,7 +692,11 @@ if businesses:
     default_business_index = next(
         (index for index, name in enumerate(business_names)
          if str(business_by_name[name]["id"]) == default_business_id), 0)
-    business_name = st.sidebar.selectbox("Business", business_names, index=default_business_index)
+    if st.session_state.get("pending_business") in business_names:
+        st.session_state["biz_select"] = st.session_state.pop("pending_business")
+    if st.session_state.get("biz_select") not in business_names:
+        st.session_state["biz_select"] = business_names[default_business_index]
+    business_name = st.sidebar.selectbox("Business", business_names, key="biz_select")
     business_id = int(business_by_name[business_name]["id"])
 nav = {
     "▦  Dashboard": "Dashboard", "↗  Revenue & expense": "Revenue & Expense",
@@ -666,6 +728,7 @@ nav_choice = st.session_state["nav_choice"]
 
 def pick_nav(group_name: str) -> None:
     st.session_state["nav_choice"] = st.session_state[f"nav_radio_{group_name}"]
+    st.session_state.pop("drill_from", None)
 
 for group_name, group_items in NAV_GROUPS.items():
     # keep each group's radio in sync with the current page (None when the page is in another group)
@@ -991,10 +1054,20 @@ if page == "Dashboard":
     total_review = sum(int(row["needs_review"] or 0) for row in summary)
     total_loc = sum(float(row["loc_balance"] or 0) for row in summary)
     c1, c2, c3, c4 = st.columns(4)
-    with c1: metric_card("Revenue", money(total_revenue), "Confirmed income", "↗", "teal")
-    with c2: metric_card("Expenses", money(total_expense), "Net of refunds", "↘", "rose")
-    with c3: metric_card("Net position", money(total_revenue - total_expense), "Revenue less expenses", "◆", "navy")
-    with c4: metric_card("Needs review", f"{total_review:,}", "Transactions awaiting you", "✓", "gold")
+    drill = not all_businesses
+    with c1:
+        if metric_card("Revenue", money(total_revenue), "Confirmed income", "↗", "teal", "rev" if drill else ""):
+            open_transactions(treatments=["Revenue", "Revenue refund"])
+    with c2:
+        if metric_card("Expenses", money(total_expense), "Net of refunds", "↘", "rose", "exp" if drill else ""):
+            open_transactions(treatments=["Expense", "Expense refund"])
+    with c3:
+        if metric_card("Net position", money(total_revenue - total_expense), "Revenue less expenses", "◆", "navy", "net" if drill else ""):
+            open_transactions(treatments=["Revenue", "Revenue refund", "Expense", "Expense refund"])
+    with c4:
+        if metric_card("Needs review", f"{total_review:,}", "Transactions awaiting you", "✓", "gold",
+                       "rvw" if drill and total_review else ""):
+            open_transactions(statuses=["needs_review"])
     section_label("Quick actions")
     a1, a2, a3, a4, a5, a6 = st.columns(6)
     with a1:
@@ -1017,9 +1090,12 @@ if page == "Dashboard":
                                       "needs_review": "Needs review", "revenue": "Revenue",
                                       "expense": "Expense", "net": "Net", "loc_balance": "LOC balance",
                                       "latest_transaction": "Latest transaction"})
-        st.dataframe(frame[["Business", "Transactions", "Needs review", "Revenue", "Expense", "Net", "LOC balance", "Latest transaction"]],
-                     hide_index=True, width="stretch",
-                     column_config={key: st.column_config.NumberColumn(format="$%.2f") for key in ["Revenue", "Expense", "Net", "LOC balance"]})
+        clicked = drill_table(frame[["Business", "Transactions", "Needs review", "Revenue", "Expense", "Net", "LOC balance", "Latest transaction"]],
+                              "dash_portfolio_table",
+                              column_config={key: st.column_config.NumberColumn(format="$%.2f") for key in ["Revenue", "Expense", "Net", "LOC balance"]})
+        if clicked is not None:
+            open_transactions(business=str(clicked["Business"]), statuses=["needs_review"] if int(clicked["Needs review"] or 0) else None)
+        st.caption("Click a business to see its transactions (those waiting for review first, if any).")
     if total_loc:
         st.caption(f"Outstanding line-of-credit principal across this view: {money(total_loc)}")
 
@@ -1055,9 +1131,16 @@ if page == "Dashboard":
         if shown.empty:
             st.caption("No revenue recorded yet.")
         else:
-            st.dataframe(shown[["Vendor / party", "Revenue", "Transactions", "Last activity"]], hide_index=True,
-                         width="stretch", height=min(35 * (len(shown) + 1) + 3, 940),
-                         column_config={"Revenue": st.column_config.NumberColumn(format="$%.2f")})
+            vendor_view = shown[["Vendor / party", "Revenue", "Transactions", "Last activity"]].reset_index(drop=True)
+            picked = st.dataframe(vendor_view, hide_index=True, width="stretch", height=min(35 * (len(shown) + 1) + 3, 940),
+                                  column_config={"Revenue": st.column_config.NumberColumn(format="$%.2f")},
+                                  on_select=None if all_businesses else "rerun", selection_mode=["single-cell", "single-row"],
+                                  key=f"dash_vendor_table_{st.session_state.get('drill_gen', 0)}")
+            if not all_businesses and clicked_position(picked) is not None:
+                open_transactions(search=str(vendor_view.iloc[clicked_position(picked)]["Vendor / party"]),
+                                  treatments=["Revenue", "Revenue refund"])
+            if not all_businesses:
+                st.caption("Click a row to see its transactions.")
         category_dash = pd.DataFrame(dash_categories)
         if not category_dash.empty:
             category_dash = category_dash.rename(columns={"category": "Category", "expense": "Expense",
@@ -1069,9 +1152,17 @@ if page == "Dashboard":
         st.markdown(f"**Expense by category** · {len(ranked)} categories · total "
                     f"{money(float(ranked['Expense'].sum())) if len(ranked) else money(0)}")
         if len(ranked):
-            st.dataframe(ranked[["Category", "Expense", "Transactions"]], hide_index=True, width="stretch",
-                         height=min(35 * (len(ranked) + 1) + 3, 940),
-                         column_config={"Expense": st.column_config.NumberColumn(format="$%.2f")})
+            category_view = ranked[["Category", "Expense", "Transactions"]].reset_index(drop=True)
+            picked = st.dataframe(category_view, hide_index=True, width="stretch",
+                                  height=min(35 * (len(ranked) + 1) + 3, 940),
+                                  column_config={"Expense": st.column_config.NumberColumn(format="$%.2f")},
+                                  on_select=None if all_businesses else "rerun", selection_mode=["single-cell", "single-row"],
+                                  key=f"dash_category_table_{st.session_state.get('drill_gen', 0)}")
+            if not all_businesses and clicked_position(picked) is not None:
+                open_transactions(categories=[str(category_view.iloc[clicked_position(picked)]["Category"])],
+                                  treatments=["Expense", "Expense refund"])
+            if not all_businesses:
+                st.caption("Click a row to see its transactions.")
         else:
             st.caption("No expense recorded yet.")
         st.button("▥  Open vendor report", on_click=go_to, args=("▥  Reports",), key="dash_to_vendor")
@@ -1088,7 +1179,7 @@ if page == "Dashboard":
     if dash_loans:
         with db.connect(DB_PATH) as connection:
             dash_equity = db.owner_equity(connection, dash_ids)
-        render_loan_balances(dash_loans, show_business=all_businesses, equity=dash_equity)
+        render_loan_balances(dash_loans, show_business=all_businesses, equity=dash_equity, key_prefix="dash_loans")
         st.button("▥  Open loan reports", on_click=go_to, args=("▥  Reports",), key="dash_to_loans")
     else:
         st.caption("No loan activity recorded yet.")
@@ -1445,6 +1536,29 @@ elif page == "Import / Paste":
                     count = db.undo_import_batch(connection, int(batch_map[chosen]["id"]))
                 st.success(f"Removed {count} transactions from that batch.")
                 rerun()
+            move_targets = {a["name"]: int(a["id"]) for a in accounts
+                            if int(a["id"]) != int(batch_map[chosen].get("account_id") or 0)}
+            m1, m2 = st.columns([2, 1])
+            move_to = m1.selectbox("Picked the wrong account? Move that import to", list(move_targets), key="batch_move_to")
+            batch_reverse = st.checkbox("Reverse the direction of every line (a card statement imported into a bank account, "
+                                        "or the other way round)", key="batch_move_reverse")
+            if m2.button("Move import", key="batch_move_go"):
+                try:
+                    with db.connect(DB_PATH) as connection:
+                        moved = db.move_batch_account(connection, business_id=business_id,
+                                                      batch_id=int(batch_map[chosen]["id"]), new_account_id=move_targets[move_to],
+                                                      reverse=batch_reverse)
+                    message = f"Moved {moved['moved']} transactions to {move_to}."
+                    if moved["reset_to_review"]:
+                        message += f" {moved['reset_to_review']} changed direction and were reset to Needs review."
+                    if moved["skipped"]:
+                        message += f" Skipped {len(moved['skipped'])}: " + "; ".join(moved["skipped"][:3])
+                    st.session_state["batch_move_msg"] = message
+                    rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+            if st.session_state.get("batch_move_msg"):
+                st.success(st.session_state.pop("batch_move_msg"))
     else:
         st.info("No imports yet.")
 
@@ -2421,12 +2535,14 @@ elif page == "Transactions":
     page_header("Every transaction, one ledger",
                 "Search every visible field and combine date, account, category, treatment, and status filters.",
                 "Transaction ledger")
+    if st.session_state.get("drill_from"):
+        st.button("← Back to " + nav[st.session_state["drill_from"]], key="txn_back", on_click=go_back)
     with db.connect(DB_PATH) as connection:
         accounts = db.list_accounts(connection, business_id)
         categories = db.list_categories(connection, business_id)
         rows = db.list_transactions(connection, business_id, limit=100000)
     search_col, sort_col, dir_col = st.columns([5, 2, 2.4], vertical_alignment="bottom")
-    search = search_col.text_input("Search", placeholder="Search merchant, amount, note, reference, category…",
+    search = search_col.text_input("Search", key="txn_search", placeholder="Search merchant, amount, note, reference, category…",
                                    label_visibility="collapsed")
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -2442,21 +2558,22 @@ elif page == "Transactions":
     frame["Split"] = [("🔒 Split original" if status == "split" else f"↳ Line of #{int(parent)}" if pd.notna(parent)
                        else "Needs split" if int(linked or 0) >= 2 else "")
                       for status, parent, linked in zip(frame["status"], frame["split_parent_id"], frame["linked_checks"])]
-    with st.expander("Filters: accounts, categories, treatment, status, dates, split", expanded=False):
+    with st.expander("Filters: accounts, categories, treatment, status, dates, split",
+                     expanded=bool(st.session_state.get("txn_cat_filter") or st.session_state.get("txn_treat_filter"))):
         f1, f2, f3, f4, f5, f6, f7 = st.columns([1, 1, 1, 1, .8, 1.25, 1])
         with f1:
             account_filters = st.multiselect("Accounts", sorted(frame["account"].dropna().unique()),
                                              placeholder="All accounts")
         with f2:
             category_filters = st.multiselect("Categories", sorted(frame["category"].unique()),
-                                              placeholder="All categories")
+                                              key="txn_cat_filter", placeholder="All categories")
         with f3:
             treatment_filters = st.multiselect("Treatments", sorted(frame["treatment"].dropna().unique()),
-                                               placeholder="All treatments")
+                                               key="txn_treat_filter", placeholder="All treatments")
         with f4:
             status_options = sorted(frame["status"].dropna().unique())
             status_filters = st.multiselect("Statuses", status_options, key="txn_status_filter",
-                                            default=["needs_review"] if "needs_review" in status_options else [],
+                                            default=(["needs_review"] if "needs_review" in status_options and "txn_status_filter" not in st.session_state else None),
                                             placeholder="All statuses")
         with f5:
             side_filters = st.multiselect("Debit / Credit", ["Debit", "Credit"], placeholder="Both")
@@ -2723,6 +2840,47 @@ elif page == "Transactions":
             else:
                 fr.text_input("From (us)", value=ours, disabled=True, key="txd_us" + suffix)
                 party = party_picker(to, "To (who received it)", txn["counterparty"] or "", "txd_party" + suffix, dialog_parties)
+            if not is_child:
+                with st.expander("Wrong direction? Debit or credit"):
+                    now_in = amount >= 0
+                    st.caption(f"Now {money(amount)} ({'credit, money in' if now_in else 'debit, money out'}). "
+                               "Flipping makes it " + ("a debit (money out)." if now_in else "a credit (money in).")
+                               + " Its category and treatment go back to Needs review.")
+                    if st.button("Flip to " + ("debit" if now_in else "credit"), key="txd_flip" + suffix):
+                        try:
+                            with db.connect(DB_PATH) as connection:
+                                db.flip_direction(connection, business_id=business_id, transaction_id=transaction_id)
+                            st.toast("Direction changed")
+                            rerun_dialog()
+                        except ValueError as exc:
+                            st.error(str(exc))
+            if not is_child:
+                with st.expander(f"Wrong account? Currently {txn['account_name']}"):
+                    other_accounts = {a["name"]: int(a["id"]) for a in accounts if int(a["id"]) != int(txn["account_id"])}
+                    target_name = st.selectbox("Move to account", list(other_accounts), key="txd_move" + suffix)
+                    reverse_it = st.checkbox("Reverse the direction (it came from a card statement, where charges are listed "
+                                             "as positive, or the other way round)", key="txd_reverse" + suffix)
+                    try:
+                        with db.connect(DB_PATH) as connection:
+                            move_plan = db.plan_account_move(connection, transaction_id, other_accounts[target_name], reverse_it)
+                    except ValueError as exc:
+                        move_plan = None
+                        st.caption(str(exc))
+                    if move_plan:
+                        st.caption(f"Amount {money(move_plan['old_signed'])} → {money(move_plan['new_signed'])} "
+                                   f"({'money in' if move_plan['new_signed'] >= 0 else 'money out'}).")
+                        if move_plan["flips"]:
+                            st.warning("The direction is reversed, so its category and treatment are reset to Needs review.")
+                        if st.button("Move to this account", key="txd_move_go" + suffix):
+                            try:
+                                with db.connect(DB_PATH) as connection:
+                                    db.move_transaction_account(connection, business_id=business_id,
+                                                                transaction_id=transaction_id,
+                                                                new_account_id=other_accounts[target_name], reverse=reverse_it)
+                                st.toast(f"Moved to {target_name}")
+                                rerun_dialog()
+                            except ValueError as exc:
+                                st.error(str(exc))
             d1, d2 = st.columns(2)
             cat_options = ["Uncategorized"] + list(category_by_name)
             current_cat = txn["category_name"] if txn["category_name"] in category_by_name else "Uncategorized"
@@ -2984,7 +3142,7 @@ elif page == "Reports":
                     st.error(str(exc))
         with db.connect(DB_PATH) as connection:
             report_equity = db.owner_equity(connection, [business_id], r_start, r_end)
-        render_loan_balances(loan_rows, equity=report_equity)
+        render_loan_balances(loan_rows, equity=report_equity, key_prefix="rep_loans")
         if not loan_rows:
             st.info("No loan activity in this period.")
         else:
